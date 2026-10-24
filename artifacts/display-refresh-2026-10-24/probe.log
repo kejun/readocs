@@ -1,0 +1,18 @@
+STATE paired=true documents=449 cached_documents=3 view=articles list_index=0
+ACCEPTED epd_probe
+epd probe mode=quality area=partial iter=1 time_ms=1530
+epd probe mode=quality area=partial iter=2 time_ms=1530
+epd probe mode=quality area=full iter=1 time_ms=2284
+epd probe mode=quality area=full iter=2 time_ms=2286
+epd probe mode=text area=partial iter=1 time_ms=1530
+epd probe mode=text area=partial iter=2 time_ms=1401
+epd probe mode=text area=full iter=1 time_ms=2228
+epd probe mode=text area=full iter=2 time_ms=1752
+epd probe mode=fast area=partial iter=1 time_ms=464
+epd probe mode=fast area=partial iter=2 time_ms=408
+epd probe mode=fast area=full iter=1 time_ms=692
+epd probe mode=fast area=full iter=2 time_ms=439
+epd probe mode=fastest area=partial iter=1 time_ms=341
+epd probe mode=fastest area=partial iter=2 time_ms=300
+epd probe mode=fastest area=full iter=1 time_ms=516
+epd probe mode=fastest area=full iter=2 time_ms=330

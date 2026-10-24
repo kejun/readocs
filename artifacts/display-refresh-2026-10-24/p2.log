@@ -1,0 +1,38 @@
+P2 measurements
+
+Threshold 3, natural full transition:
+epd ui mode=text time_ms=2309 cleanup=0 partial_before=0
+epd partial mode=fast time_ms=441 partial=1/3
+epd partial mode=fast time_ms=440 partial=2/3
+epd partial mode=fast time_ms=438 partial=3/3
+epd ui mode=quality time_ms=2344 cleanup=1 partial_before=3
+
+Threshold 3, idle cleanup:
+epd ui mode=text time_ms=5950 cleanup=0 partial_before=0
+epd partial mode=fast time_ms=1615 partial=1/3
+epd partial mode=fast time_ms=438 partial=2/3
+epd partial mode=fast time_ms=437 partial=3/3
+epd ui mode=quality time_ms=2280 cleanup=1 partial_before=3
+
+Threshold 20, idle cleanup:
+epd partial mode=fast time_ms=441 partial=1/20
+...
+epd partial mode=fast time_ms=443 partial=20/20
+epd ui mode=quality time_ms=2280 cleanup=1 partial_before=20
+
+Under background sync, individual updates sometimes slowed:
+epd partial mode=fast time_ms=1200 partial=15/20
+epd partial mode=fast time_ms=1321 partial=16/20
+epd partial mode=fast time_ms=2231 partial=12/20
+
+Full text draw resets the partial counter:
+epd partial mode=fast time_ms=440 partial=1/20
+epd partial mode=fast time_ms=441 partial=2/20
+epd ui mode=text time_ms=1739 cleanup=0 partial_before=2
+status partial_updates=0
+
+Long-run activity test:
+epd partial mode=fast time_ms=436 partial=19/20
+epd partial mode=fast time_ms=438 partial=20/20
+epd partial mode=fast time_ms=1660 partial=21/20
+epd ui mode=quality time_ms=2278 cleanup=1 partial_before=21

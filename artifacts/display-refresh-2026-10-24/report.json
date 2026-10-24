@@ -1,0 +1,73 @@
+{
+  "date": "2026-10-24",
+  "firmware": "readocs-0.2.2",
+  "board": "M5Stack PaperDIY / ESP32-S3",
+  "idf": "v5.5.5",
+  "m5gfx": "02107b828acb3eb782fccd747863638d64c876d7",
+  "m5unified": "2fe93c0c64f12f916e73a0605c86bf1241c06a6b",
+  "driver": "M5GFX Panel_EPD + Bus_EPD (8-bit parallel)",
+  "framebuffer": {
+    "logical_size": "540x960",
+    "internal_panel_size": "960x540",
+    "write_depth": "grayscale_8bit",
+    "bits_per_pixel": 4
+  },
+  "ui_refresh_flow": [
+    "reader.cpp begin() -> fillScreen(TFT_WHITE)",
+    "reader.cpp draw_* -> full UI redraw",
+    "reader.cpp finish() -> setEpdMode(epd_quality) -> display() -> waitDisplay()",
+    "Panel_EPD::display() has no explicit area; it applies the accumulated _range_mod",
+    "fillScreen marks the whole screen in _range_mod, so every current UI draw is a full-screen refresh"
+  ],
+  "partial_refresh_support": {
+    "api": "Panel_EPD::display(x, y, w, h) and Panel_EPD::_update_transferred_rect",
+    "region_tracking": "_range_mod accumulates write bounds when setAutoDisplay(false)",
+    "alignment_limit": "x is aligned down to an even pixel; width is expanded to include the pair",
+    "empirical": "A 476x240 probe region is consistently faster than a 540x960 probe region, so a real panel-area update is occurring.",
+    "not_a_full_screen": true
+  },
+  "lut_steps": {
+    "quality": 20,
+    "text": 13,
+    "fast": 9,
+    "fastest": 6
+  },
+  "grayscale": {
+    "quality": "16-level LUT, 4bpp source",
+    "text": "16-level LUT with eraser phase, 4bpp source",
+    "fast": "1-bit Bayer threshold, no gray levels",
+    "fastest": "1-bit Bayer threshold, no gray levels"
+  },
+  "baseline_ui": {
+    "mode": "quality",
+    "area": "full 540x960",
+    "measured_ms": 2283,
+    "source": "readocs: epd ui mode=quality time_ms=2283"
+  },
+  "probe_results_ms": [
+    {"mode": "quality", "area": "partial", "iterations": [1530, 1530]},
+    {"mode": "quality", "area": "full", "iterations": [2284, 2286]},
+    {"mode": "text", "area": "partial", "iterations": [1530, 1401]},
+    {"mode": "text", "area": "full", "iterations": [2228, 1752]},
+    {"mode": "fast", "area": "partial", "iterations": [464, 408]},
+    {"mode": "fast", "area": "full", "iterations": [692, 439]},
+    {"mode": "fastest", "area": "partial", "iterations": [341, 300]},
+    {"mode": "fastest", "area": "full", "iterations": [516, 330]}
+  ],
+  "probe_scenario": {
+    "serial_command": "{\"cmd\":\"epd_probe\",\"mode\":0,\"area\":\"both\",\"count\":2}",
+    "mode_values": {"0": "all", "1": "quality", "2": "text", "3": "fast", "4": "fastest"},
+    "area_values": {"both": 0, "partial": 1, "full": 2},
+    "probe_area": "x=32,y=120,w=476,h=240",
+    "pattern": "white background, 24px text, moving black block; measurements cover display()+waitDisplay() only"
+  },
+  "conclusions": [
+    "The current obvious full-screen flash is caused by begin()/fillScreen, not by a missing driver partial-refresh capability.",
+    "Partial rectangular refresh is real and measurably faster, but quality-mode fixed cost is still high (about 1.5s for the probe region).",
+    "epd_text is the candidate default for full-page text UI because it keeps 4bpp/16-level output and is somewhat faster than quality.",
+    "epd_fast and epd_fastest are much faster, but are 1-bit and need dedicated ghosting/clarity validation before becoming the default.",
+    "For menu cursor movement, the next step is a small-region update with fast/fastest plus a periodic quality cleanup, not another full-screen redraw."
+  ],
+  "visual_review": "pending operator observation; timing is measured, but perceived flash, text clarity, and ghosting require the physical screen.",
+  "next": "P1: remove the unconditional full-screen fill from redraw paths, then update menu selection rows and article-list selection rows as partial regions."
+}

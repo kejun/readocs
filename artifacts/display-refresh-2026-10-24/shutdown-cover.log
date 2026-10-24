@@ -1,0 +1,6 @@
+Firmware: readocs-0.2.2 (P2 build)
+Trigger: menu -> 6x next -> previous (关机)
+Log:
+I (40317) readocs: cover drawn: 1279x2047 -> 540x960, 138521 bytes
+I (40318) readocs: shutdown cover ready, cutting power
+Result: M5PM1 power off; serial device disappeared.

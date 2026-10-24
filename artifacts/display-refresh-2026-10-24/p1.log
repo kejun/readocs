@@ -1,0 +1,29 @@
+P1 raw measurements
+
+Full text mode, stable alternating menu/articles:
+epd ui mode=text time_ms=1638
+epd ui mode=text time_ms=1637
+epd ui mode=text time_ms=1638
+epd ui mode=text time_ms=1637
+epd ui mode=text time_ms=1638
+epd ui mode=text time_ms=1637
+
+Single partial steps:
+epd ui mode=text time_ms=1638
+epd partial mode=fast time_ms=436
+epd partial mode=fast time_ms=438
+epd ui mode=text time_ms=1711
+epd partial mode=fast time_ms=449
+
+Merged partial updates:
+MENU_BURST_PARTIALS 1
+ARTICLE_BURST_PARTIALS 1
+MENU_7STEP_PARTIALS 0
+
+Menu burst: epd partial mode=fast time_ms=477
+Article burst: epd partial mode=fast time_ms=1021
+
+Timing outliers in a session with earlier activity:
+epd ui mode=text time_ms=2311
+epd ui mode=text time_ms=1939
+epd ui mode=text time_ms=3088

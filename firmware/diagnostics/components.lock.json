@@ -1,0 +1,9 @@
+{
+  "reference_firmware": "https://github.com/m5stack/M5PaperDIY-UserDemo",
+  "reference_commit": "60a26f0ebccc656027bde413a0e9356aae5bb6e7",
+  "esp_idf_tested": "v5.5.5",
+  "components": [
+    {"name": "M5GFX", "url": "https://github.com/m5stack/M5GFX.git", "commit": "02107b828acb3eb782fccd747863638d64c876d7"},
+    {"name": "M5Unified", "url": "https://github.com/m5stack/M5Unified.git", "commit": "2fe93c0c64f12f916e73a0605c86bf1241c06a6b"}
+  ]
+}

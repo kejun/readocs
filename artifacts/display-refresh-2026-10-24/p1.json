@@ -1,0 +1,43 @@
+{
+  "date": "2026-10-24",
+  "phase": "P1",
+  "firmware": "readocs-0.2.2",
+  "implemented": {
+    "full_text_mode": "epd_text",
+    "partial_text_mode": "epd_fast",
+    "menu": "Selection changes redraw only the old and new rows; a same-content/same-selection redraw is skipped.",
+    "articles": "Selection changes redraw only the old and new rows; page changes or content changes still use a full text refresh.",
+    "merge": "The existing main-loop key queue coalesces multiple key events into one draw.",
+    "cache_invalidation": "Full-screen draws and display probes invalidate menu/list partial-update state."
+  },
+  "code": [
+    "reader.cpp: kFullMode = epd_text, kPartialMode = epd_fast",
+    "reader.cpp: begin() sets kFullMode and invalidates partial caches",
+    "reader.cpp: finish() logs full text refresh time",
+    "reader.cpp: finish_partial() logs fast partial refresh time and uses the tracked _range_mod",
+    "reader.cpp: draw_menu() partial old/new row update",
+    "reader.cpp: draw_articles() partial old/new row update",
+    "reader.cpp: menu_signature_of/article_signature_of detect content changes",
+    "reader.cpp: run_display_probe() invalidates partial caches"
+  ],
+  "full_refresh_ms": {
+    "quality_baseline": 2283,
+    "text_typical": [1638, 1637, 1638, 1637, 1638, 1637],
+    "text_under_load_outliers": [2311, 1939, 3088],
+    "note": "The stable alternating menu/article full draw was 1637-1638 ms. The outliers occurred in a session that also had background sync/earlier partial updates."
+  },
+  "partial_refresh_ms": {
+    "menu_single_step": [436, 438, 477],
+    "article_single_step": [449],
+    "menu_3_step_burst_merged": [477],
+    "article_3_step_burst_merged": [1021]
+  },
+  "merge_checks": {
+    "menu_3_next_refreshes": 1,
+    "article_3_next_refreshes": 1,
+    "menu_7_next_returning_to_same_selection_refreshes": 0
+  },
+  "result": "A menu step drops from a 540x960 full refresh to a two-row partial refresh, typically about 0.44 s. Three queued moves produce one merged partial refresh. A seven-step cycle returning to the same selection produces no refresh.",
+  "visual_review": "pending operator observation; partial fast mode is 1-bit and may leave ghosting, so the next phase must count partial refreshes and schedule quality cleanup if needed.",
+  "next": "P2: count consecutive partial updates, test periodic quality cleanup thresholds, and check ghosting/clarity on menu, list, page turns, and long runs."
+}

@@ -1,0 +1,67 @@
+{
+  "date": "2026-10-24",
+  "phase": "P2",
+  "firmware": "readocs-0.2.2",
+  "parameters": {
+    "full_text_mode": "epd_text",
+    "partial_mode": "epd_fast",
+    "quality_mode": "epd_quality",
+    "cleanup_every_partial": 20,
+    "cleanup_idle_ms": 1000,
+    "full_screen_after_threshold": "epd_quality",
+    "image_cover": "epd_quality",
+    "partial_limit_command": "{\"cmd\":\"epd_cleanup\",\"every\":20}"
+  },
+  "behavior": [
+    "Each partial menu/list update increments partial_updates.",
+    "A full-screen draw resets partial_updates; a full draw at or above the threshold uses quality automatically.",
+    "When partial_updates >= threshold and the device is idle for 1 s, the main loop requests a quality refresh of the current view.",
+    "Cleanup is skipped while networking or AP mode is active, and does not interrupt active key presses.",
+    "The cover/image path uses quality; normal text pages use epd_text; menu/list selection uses epd_fast.",
+    "status now reports partial_updates and partial_limit."
+  ],
+  "measurements": {
+    "threshold_3_full_transition": {
+      "full_text_ms": 2309,
+      "partial_ms": [441, 440, 438],
+      "quality_cleanup_ms": 2344,
+      "cleanup_partial_before": 3,
+      "after_partial_updates": 0
+    },
+    "threshold_3_idle": {
+      "full_text_ms": 5950,
+      "partial_ms": [1615, 438, 437],
+      "quality_cleanup_ms": 2280,
+      "cleanup_partial_before": 3,
+      "after_partial_updates": 0,
+      "note": "The 5950 ms full draw and 1615 ms partial occurred while a background sync was active."
+    },
+    "threshold_20_idle": {
+      "partial_ms_typical": [436, 470],
+      "partial_ms_under_sync": [1200, 1321, 2231],
+      "quality_cleanup_ms": 2280,
+      "cleanup_partial_before": 20,
+      "after_partial_updates": 0
+    },
+    "full_text_resets_counter": {
+      "partials_before": 2,
+      "full_text_ms": 1739,
+      "after_partial_updates": 0
+    },
+    "long_run": {
+      "cycles_attempted": 2,
+      "cycle_1": "20 partials; an extra key arrived before the 1 s idle window, so cleanup ran at partial=21/20",
+      "cleanup_ms": 2278,
+      "note": "This demonstrates that cleanup is deferred while interaction continues; the test harness then lost the second cycle through serial timing."
+    }
+  },
+  "decisions": [
+    "Keep epd_text for full text screens: stable alternating full draws measured 1637-1638 ms, versus quality baseline 2283 ms.",
+    "Keep epd_fast for menu/list rows: typical 436-470 ms and visibly local.",
+    "Use 20 consecutive partial updates as the default cleanup threshold. It can be changed at runtime for tuning.",
+    "Prefer quality cleanup on a natural full-screen transition when the threshold is already reached; otherwise do it after 1 s idle.",
+    "Do not insert quality refreshes between rapid key presses."
+  ],
+  "visual_review": "pending operator confirmation of ghosting before/after cleanup, text clarity, and absence of partial-region artifacts.",
+  "next": "If 20 is too visibly ghosted, lower the runtime limit; if the idle quality flash is too disruptive, raise it. Re-test article page changes and long reading sessions."
+}

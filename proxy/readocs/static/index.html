@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Readocs</title>
+    <link rel="icon" href="/static/logo.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <div id="login" class="login-shell" hidden>
+      <form id="login-form" class="login-form">
+        <span class="brand"
+          ><img
+            class="brand-logo"
+            src="/static/logo.svg"
+            alt=""
+            aria-hidden="true"
+          />readocs</span
+        >
+        <h1>打开你的阅读台</h1>
+        <label for="admin-key">管理密钥</label
+        ><input
+          id="admin-key"
+          type="password"
+          required
+          autocomplete="current-password"
+        />
+        <p id="login-error" class="error" role="alert"></p>
+        <button class="primary">登录</button>
+        <details>
+          <summary>在哪里找到密钥</summary>
+          <p>在运行代理的电脑上执行 <code>readocs --show-key</code>。</p>
+        </details>
+      </form>
+    </div>
+    <div id="shell" class="shell" hidden>
+      <aside class="sidebar">
+        <a href="#library" class="brand" aria-label="Readocs 首页"
+          ><img
+            class="brand-logo"
+            src="/static/logo.svg"
+            alt=""
+            aria-hidden="true"
+          />readocs</a
+        >
+        <nav aria-label="主导航">
+          <a href="#library" data-page="library"
+            ><span aria-hidden="true">▤</span>内容</a
+          ><a href="#feishu" data-page="feishu"
+            ><span aria-hidden="true">◇</span>飞书应用</a
+          ><a href="#device" data-page="device"
+            ><span aria-hidden="true">▯</span>设备</a
+          >
+        </nav>
+        <div class="sidebar-bottom">
+          <span class="local-indicator">本地代理</span
+          ><button id="logout" class="quiet">退出</button>
+        </div>
+      </aside>
+      <main>
+        <section id="library-page" class="page">
+          <header class="page-header">
+            <h1>内容</h1>
+            <button id="add-feed" class="primary">＋ 添加订阅</button>
+          </header>
+          <div class="library-layout">
+            <div class="library-list">
+              <div id="source-list"></div>
+              <div id="library-empty" class="empty" hidden>
+                <div class="empty-paper" aria-hidden="true">
+                  <i></i><i></i><i></i>
+                </div>
+                <h2>从一篇想读的内容开始</h2>
+                <a class="text-link" href="#feishu"
+                  >连接飞书文档 <span aria-hidden="true">↗</span></a
+                >
+              </div>
+              <div id="article-panel" hidden>
+                <div class="list-heading">
+                  <h2 id="article-source"></h2>
+                  <button id="close-articles" class="quiet">收起</button>
+                </div>
+                <div id="article-list"></div>
+              </div>
+            </div>
+            <aside class="reader-column" aria-label="阅读预览">
+              <div class="reader-toolbar">
+                <div>
+                  <button id="font-smaller" class="quiet" aria-label="缩小字号">
+                    A−</button
+                  ><button id="font-larger" class="quiet" aria-label="放大字号">
+                    A＋
+                  </button>
+                </div>
+              </div>
+              <div class="paper-reader">
+                <div id="reader-placeholder">
+                  <span class="reader-wordmark">readocs</span>
+                  <p>选择内容，开始阅读。</p>
+                </div>
+                <article id="reader" hidden></article>
+              </div>
+              <div id="reader-meta" class="reader-meta"></div>
+            </aside>
+          </div>
+        </section>
+        <section id="feishu-page" class="page" hidden>
+          <header class="page-header"><h1>飞书应用</h1></header>
+          <form id="feishu-form" class="settings-form">
+            <div class="field">
+              <label for="app-id">App ID</label
+              ><input
+                id="app-id"
+                name="app_id"
+                required
+                maxlength="128"
+                autocomplete="off"
+              />
+            </div>
+            <div class="field">
+              <label for="app-secret"
+                >App Secret
+                <span id="secret-state" class="field-state"></span></label
+              ><input
+                id="app-secret"
+                name="secret"
+                type="password"
+                maxlength="1024"
+                autocomplete="new-password"
+              />
+            </div>
+            <div class="form-actions">
+              <button class="primary">保存并同步</button
+              ><button
+                id="authorize-feishu"
+                type="button"
+                class="secondary"
+                hidden
+              >
+                授权飞书账号</button
+              ><button id="test-feishu" type="button" class="secondary">
+                测试凭据
+              </button>
+            </div>
+            <p id="feishu-result" role="status" class="form-result"></p>
+            <details class="help">
+              <summary>如何授权</summary>
+              <p>
+                开通云盘、云文档、知识库只读权限和
+                offline_access，并发布应用。将下方回调地址加入应用的重定向
+                URL，保存后授权飞书账号。
+              </p>
+              <p><code id="feishu-callback"></code></p>
+              <p>
+                自动同步云盘文件夹和知识库中的全部可访问云文档（docx）。单独分享且未归入可枚举目录的文档受飞书接口限制；表格和附件暂不支持。
+              </p>
+              <a
+                href="https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/guide"
+                target="_blank"
+                rel="noreferrer"
+                >查看飞书接入说明 ↗</a
+              >
+            </details>
+            <details id="feishu-details" class="help" hidden>
+              <summary>连接详情</summary>
+              <dl id="feishu-status"></dl>
+              <button id="remove-feishu" type="button" class="danger quiet">
+                移除飞书配置
+              </button>
+            </details>
+          </form>
+        </section>
+        <section id="device-page" class="page" hidden>
+          <header class="page-header">
+            <h1>设备</h1>
+            <button id="pair-device" class="primary">绑定设备</button>
+          </header>
+          <div id="device-list"></div>
+          <div id="device-empty" class="empty" hidden>
+            <div class="device-outline" aria-hidden="true">
+              <span>readocs</span>
+            </div>
+            <h2>连接你的 PaperDIY</h2>
+          </div>
+          <div id="pair-panel" class="pair-panel" hidden>
+            <h2>输入设备配对码</h2>
+            <output id="pair-code"></output>
+            <p id="pair-expiry"></p>
+            <details>
+              <summary>连接方式</summary>
+              <p>
+                设备连接 Wi-Fi 后，在设备设置中填写代理 HTTPS
+                地址与此配对码。本地开发证书通过 USB 配置工具传入。
+              </p>
+            </details>
+          </div>
+        </section>
+      </main>
+    </div>
+    <dialog id="feed-dialog">
+      <form id="feed-form">
+        <div class="dialog-heading">
+          <h2>添加订阅</h2>
+          <button
+            id="cancel-feed"
+            type="button"
+            class="quiet"
+            aria-label="关闭"
+          >
+            ×
+          </button>
+        </div>
+        <div class="field">
+          <label for="feed-url">RSS / Atom 地址</label
+          ><input
+            id="feed-url"
+            name="url"
+            type="url"
+            required
+            placeholder="https://…"
+            maxlength="2048"
+          />
+        </div>
+        <div class="field">
+          <label for="feed-interval">检查间隔</label
+          ><select id="feed-interval" name="interval">
+            <option value="600">10 分钟</option>
+            <option value="900">15 分钟</option>
+            <option value="1800" selected>30 分钟</option>
+            <option value="3600">1 小时</option>
+            <option value="10800">3 小时</option>
+          </select>
+        </div>
+        <p id="feed-error" class="error" role="alert"></p>
+        <button class="primary">添加</button>
+      </form>
+    </dialog>
+    <div id="notice" class="notice" role="status" hidden></div>
+  </body>
+</html>
