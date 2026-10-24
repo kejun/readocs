@@ -120,7 +120,7 @@ std::vector<Page> layout(const std::string &snapshot, int size) {
     return {};
   std::vector<Page> pages(1);
   int y = 94;
-  const int bottom = 887, line_height = size + 12;
+  const int bottom = 887, line_height = size + 14;
   std::string title = str(doc.get(), "title");
   cJSON *blocks = cJSON_GetObjectItemCaseSensitive(doc.get(), "blocks");
   auto add = [&](const std::string &text, bool heading, const std::string &bid,

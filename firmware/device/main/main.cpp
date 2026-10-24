@@ -176,13 +176,17 @@ extern "C" void app_main() {
     pages = layout(e.snapshot_id, size);
     page = 0;
     if (position.document == e.document_id) {
-      if (position.snapshot == e.snapshot_id && !reflow)
+      // Prefer the content anchor so a layout change (for example a line-height
+      // adjustment) does not restore an old page number against a new layout.
+      int anchored = -1;
+      for (int i = 0; i < static_cast<int>(pages.size()); ++i)
+        if (pages[i].block == position.block &&
+            pages[i].offset <= position.offset)
+          anchored = i;
+      if (anchored >= 0)
+        page = anchored;
+      else if (position.snapshot == e.snapshot_id && !reflow)
         page = position.page;
-      else
-        for (int i = 0; i < static_cast<int>(pages.size()); ++i)
-          if (pages[i].block == position.block &&
-              pages[i].offset <= position.offset)
-            page = i;
     }
     if (std::string(retained_document) == e.document_id &&
         wake != ESP_SLEEP_WAKEUP_UNDEFINED &&
