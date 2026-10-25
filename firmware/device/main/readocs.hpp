@@ -52,7 +52,7 @@ struct Model {
   std::mutex mutex;
   Config config;
   std::vector<Entry> entries;
-  std::string current_document, displayed_snapshot;
+  std::string current_source, current_document, displayed_snapshot;
   int page = 0;
   View view = View::Articles;
   int list_index = 0, page_count = 0;
@@ -64,8 +64,16 @@ struct Model {
 };
 extern Model model;
 extern std::atomic<bool> connected, networking, redraw, setup_requested;
+extern std::atomic<bool> input_idle;
 extern std::atomic<int64_t> last_input, ap_activity;
+extern std::atomic<bool> power_off_requested;
 extern QueueHandle_t actions, buttons;
+void configure_power_key();
+void power_key_poll();
+void power_key_prepare_sleep();
+void power_key_shutdown();
+uint16_t pm1_vbus_voltage();
+uint8_t pm1_register(uint8_t reg);
 struct Action {
   std::string type, json;
 };
@@ -100,7 +108,7 @@ bool save_config(const Config &cfg);
 bool commit_cache(const std::vector<Entry> &entries, const std::string &etag);
 void save_position(const Position &pos);
 Position load_position(const std::string &document);
-void collect_cache();
+void collect_cache(bool reclaim_previous = false);
 void display_marker(bool pending, const std::string &snapshot = "");
 bool display_pending();
 void init_network();

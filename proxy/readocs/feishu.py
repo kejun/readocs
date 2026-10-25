@@ -204,7 +204,7 @@ class Feishu:
             return obj["data"]
         raise Problem("UPSTREAM_AUTH_REQUIRED", "飞书授权已失效，请检查应用配置", 403)
 
-    async def fetch(self, did, url=""):
+    async def fetch(self, did, url="", *, updated=None):
         before = (await self.get(did)).get("document", {})
         if "revision_id" not in before:
             raise Problem("PARSE_ERROR", "文档缺少修订版本", 502)
@@ -234,4 +234,5 @@ class Feishu:
             before.get("title", "未命名文档")[:256],
             feishu_blocks(raw),
             url=url,
+            updated=updated,
         )

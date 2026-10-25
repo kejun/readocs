@@ -1,16 +1,22 @@
 import hashlib
 import re
+import secrets
+from collections import Counter, defaultdict, deque
 from html.parser import HTMLParser
 from urllib.parse import urlsplit, urlunsplit
 
 from defusedxml import ElementTree as ET
 
+from .dates import article_order, timestamp
 from .errors import Problem
 from .store import canonical, digest
 
 ATOM = "{http://www.w3.org/2005/Atom}"
 CONTENT = "{http://purl.org/rss/1.0/modules/content/}"
 XHTML = "{http://www.w3.org/1999/xhtml}"
+FEED_MAX_BYTES = 16 * 1024 * 1024
+FEED_ARTICLE_MAX_BYTES = 64 * 1024
+FEED_TRUNCATION_NOTE = "正文较长，以下为部分内容；完整内容请查看原文。"
 
 
 class TextHTML(HTMLParser):
@@ -79,8 +85,10 @@ def blocks_from_text(text):
     return blocks
 
 
-def document(doc_id, title, blocks, *, url="", updated=None, summary=False):
-    selected, truncated, size = [], False, 0
+def document(
+    doc_id, title, blocks, *, url="", updated=None, summary=False, truncated=False
+):
+    selected, size = [], 0
     for block in blocks:
         if len(block.get("text", "").encode()) > 65536:
             raise Problem("CONTENT_TOO_LARGE", "单段正文超过 64 KiB", 422)
@@ -121,10 +129,95 @@ def normalize_url(url):
     return urlunsplit((p.scheme.lower(), host, p.path, p.query, ""))
 
 
-def parse_feed(body: bytes, sid: str):
-    if len(body) > 2 * 1024 * 1024 or re.search(
-        rb"<!\s*(DOCTYPE|ENTITY)", body, re.IGNORECASE
-    ):
+class FeedIdentities:
+    """Match degraded entries without treating a shared title as a unique ID."""
+
+    def __init__(self, previous=()):
+        self.previous = list(previous)
+        self.records = []
+        self.members = []
+
+    def resolve(self, entries):
+        remaining = {row["document_id"]: row for row in self.previous}
+        assigned = {}
+        buckets = defaultdict(deque)
+        titles = defaultdict(deque)
+        title_counts = Counter(row["title"] for row in self.previous)
+        incoming_counts = Counter(entry["title"] for entry in entries)
+        for row in sorted(self.previous, key=lambda row: row["document_id"]):
+            did, fingerprint, title, updated = (
+                row["document_id"],
+                row["fingerprint"],
+                row["title"],
+                row["updated"],
+            )
+            for key in (
+                (fingerprint, title, updated),
+                (fingerprint, title),
+                (fingerprint, None, updated),
+                (fingerprint,),
+            ):
+                buckets[key].append(did)
+            titles[title].append(did)
+
+        def available(bucket):
+            while bucket and bucket[0] not in remaining:
+                bucket.popleft()
+            return bucket[0] if bucket else None
+
+        def assign(index, did):
+            assigned[index] = did
+            title_counts[remaining.pop(did)["title"]] -= 1
+            incoming_counts[entries[index]["title"]] -= 1
+
+        # Match unchanged bodies first across the whole feed, so a newly inserted
+        # same-title entry cannot steal an older article's ID before it is visited.
+        for specificity in range(4):
+            for index, entry in enumerate(entries):
+                if index in assigned:
+                    continue
+                fingerprint, title, updated = (
+                    entry["fingerprint"],
+                    entry["title"],
+                    entry["updated"],
+                )
+                key = (
+                    (fingerprint, title, updated),
+                    (fingerprint, title),
+                    (fingerprint, None, updated),
+                    (fingerprint,),
+                )[specificity]
+                did = available(buckets[key])
+                if did:
+                    assign(index, did)
+        # A unique surviving title can identify an edited body, unless two known
+        # publication times show that this is a later issue of a recurring title.
+        for index, entry in enumerate(entries):
+            if index in assigned:
+                continue
+            title = entry["title"]
+            if title_counts[title] == incoming_counts[title] == 1:
+                did = available(titles[title])
+                previous_date = timestamp(remaining[did]["updated"])
+                current_date = timestamp(entry["updated"])
+                if (
+                    previous_date is not None
+                    and current_date is not None
+                    and previous_date != current_date
+                ):
+                    continue
+                assign(index, did)
+        self.records = [
+            {**entry, "document_id": assigned.get(i) or secrets.token_hex(16)}
+            for i, entry in enumerate(entries)
+        ]
+        return [row["document_id"] for row in self.records]
+
+
+def parse_feed(body: bytes, sid: str, *, identities=None):
+    if len(body) > FEED_MAX_BYTES:
+        raise Problem("CONTENT_TOO_LARGE", "订阅源超过 16 MiB 限制", 422)
+    if re.search(rb"<!\s*(DOCTYPE|ENTITY)", body, re.IGNORECASE):
         raise Problem("PARSE_ERROR", "不支持含 DTD 或实体声明的源", 422)
     declared = re.search(
         rb"<\?xml[^>]*encoding=[\"'](gb18030|gbk|gb2312)[\"']",
@@ -144,6 +237,8 @@ def parse_feed(body: bytes, sid: str):
             body = decoded.encode("utf-8")
         except UnicodeError:
             raise Problem("PARSE_ERROR", "源声明的中文编码与正文不匹配", 422) from None
+        if len(body) > FEED_MAX_BYTES:
+            raise Problem("CONTENT_TOO_LARGE", "解码后的订阅源超过 16 MiB 限制", 422)
     try:
         root = ET.fromstring(body)
         count = 0
@@ -166,8 +261,8 @@ def parse_feed(body: bytes, sid: str):
         atom = False
     else:
         raise Problem("SOURCE_UNSUPPORTED", "首版支持 RSS 2.0 与 Atom 1.0", 422)
-    docs, seen = [], set()
-    for e in entries[:50]:
+    docs, seen, parsed, degraded = [], set(), [], []
+    for e in entries:
         if atom:
             title_e = e.findtext(ATOM + "title", "未命名文章")
             link = next(
@@ -210,27 +305,82 @@ def parse_feed(body: bytes, sid: str):
             text = clean_html(
                 text if text is not None else e.findtext("description", "")
             )
-        if not identity:
-            identity = normalize_url(link) if link else "fallback:" + title_e
-        did = hashlib.sha256((sid + "\0" + identity).encode()).hexdigest()[:32]
-        if did in seen:
-            continue
-        seen.add(did)
-        if len(text.encode()) > 65536:
-            raise Problem("CONTENT_TOO_LARGE", "文章正文超过 64 KiB，旧版本已保留", 422)
+        blocks = blocks_from_text(text or "[此条目没有正文]")
+        if not identity and link:
+            identity = normalize_url(link)
+        if identity:
+            did = hashlib.sha256((sid + "\0" + identity).encode()).hexdigest()[:32]
+            if did in seen:
+                continue
+            seen.add(did)
+        else:
+            did = None
+            degraded.append(
+                {
+                    "title": title_e[:256],
+                    "fingerprint": digest(canonical([b["text"] for b in blocks])),
+                    "updated": updated,
+                }
+            )
         if urlsplit(link).scheme not in ("http", "https"):
             link = ""
+        blocks, truncated = feed_article_blocks(blocks)
+        parsed.append((did, title_e[:256], blocks, link, updated, summary, truncated))
+    identities = identities or FeedIdentities()
+    fallback_ids = iter(identities.resolve(degraded))
+    for did, title_e, blocks, link, updated, summary, truncated in parsed:
         docs.append(
             document(
-                did,
-                title_e[:256],
-                blocks_from_text(text or "[此条目没有正文]"),
+                did or next(fallback_ids),
+                title_e,
+                blocks,
                 url=link,
                 updated=updated,
                 summary=summary,
+                truncated=truncated,
             )
         )
-    return title[:256], docs
+    identities.members = [doc["document_id"] for doc in docs]
+    docs.sort(key=article_order)
+    return title[:256], docs[:50]
+
+
+def feed_article_blocks(blocks):
+    """Keep a bounded readable prefix without rejecting other feed entries."""
+    lengths = [len(block["text"].encode("utf-8")) for block in blocks]
+    if (
+        sum(lengths) + max(0, len(blocks) - 1) * 2 <= FEED_ARTICLE_MAX_BYTES
+        and len(blocks) <= 500
+    ):
+        return blocks, False
+    # Older readers render blocks but do not display the truncated metadata.
+    # Reserve space for a visible notice inside both the byte and block budgets.
+    notice = {
+        "block_id": "readocs-note-truncated",
+        "type": "paragraph",
+        "text": FEED_TRUNCATION_NOTE,
+        "depth": 0,
+        "meta": {},
+    }
+    budget = FEED_ARTICLE_MAX_BYTES - len(FEED_TRUNCATION_NOTE.encode("utf-8")) - 2
+    selected, size = [], 0
+    for block, length in zip(blocks, lengths):
+        if len(selected) >= 499:
+            break
+        # Include paragraph separators in the text budget.
+        length += 2 if selected else 0
+        if size + length > budget:
+            if not selected:
+                prefix = (
+                    block["text"]
+                    .encode("utf-8")[:budget]
+                    .decode("utf-8", errors="ignore")
+                )
+                selected = blocks_from_text(prefix)
+            break
+        selected.append(block)
+        size += length
+    return [notice, *selected], True
 
 
 def feishu_blocks(raw):

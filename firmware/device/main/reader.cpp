@@ -30,10 +30,15 @@ static bool articles_valid = false;
 static std::string articles_signature;
 static int articles_selected = -1;
 static int articles_start = -1;
+static bool page_valid = false;
+static std::string page_document, page_snapshot;
+static unsigned page_font_size = 0;
+static int page_index = -1, page_count = 0;
 
 static void invalidate_navigation() {
   menu_valid = false;
   articles_valid = false;
+  page_valid = false;
 }
 
 static const char *epd_mode_name(int mode) {
@@ -255,23 +260,39 @@ void draw_page(const Entry &e, const std::vector<Page> &pages, int index) {
   if (pages.empty())
     return;
   index = std::clamp(index, 0, static_cast<int>(pages.size()) - 1);
-  begin();
   auto &d = M5.Display;
-  font(16);
-  d.setCursor(32, 25);
-  std::string title = e.title;
-  while (!title.empty() && d.textWidth(title.c_str()) > 475) {
-    size_t i = title.size() - 1;
-    while (i > 0 && (static_cast<unsigned char>(title[i]) & 0xc0) == 0x80)
-      --i;
-    title.resize(i);
-  }
-  d.print(title.c_str());
-  d.drawFastHLine(32, 62, 476, TFT_BLACK);
   unsigned size;
   {
     std::lock_guard<std::mutex> g(model.mutex);
     size = model.config.font_size;
+  }
+  const bool partial =
+      page_valid && page_document == e.document_id &&
+      page_snapshot == e.snapshot_id && page_font_size == size &&
+      page_count == static_cast<int>(pages.size()) && page_index != index &&
+      !force_quality.load() && partial_updates.load() < partial_limit.load();
+  if (partial) {
+    // A page turn only changes the body and footer. Keep the title and its rule
+    // on the panel, clear the rest of the persistent framebuffer, and use the
+    // fast 1-bit waveform. Periodic cleanup restores gray levels.
+    d.setEpdMode(kPartialMode);
+    d.fillRect(0, 63, d.width(), d.height() - 63, TFT_WHITE);
+    d.setTextColor(TFT_BLACK, TFT_WHITE);
+    d.setTextDatum(m5gfx::textdatum_t::top_left);
+    d.setTextWrap(false);
+  } else {
+    begin();
+    font(16);
+    d.setCursor(32, 25);
+    std::string title = e.title;
+    while (!title.empty() && d.textWidth(title.c_str()) > 475) {
+      size_t i = title.size() - 1;
+      while (i > 0 && (static_cast<unsigned char>(title[i]) & 0xc0) == 0x80)
+        --i;
+      title.resize(i);
+    }
+    d.print(title.c_str());
+    d.drawFastHLine(32, 62, 476, TFT_BLACK);
   }
   font(size);
   for (const auto &line : pages[index].lines) {
@@ -290,7 +311,16 @@ void draw_page(const Entry &e, const std::vector<Page> &pages, int index) {
     d.setCursor(245, 922);
     d.print(updated.substr(0, 19).c_str());
   }
-  finish(e.snapshot_id);
+  if (partial)
+    finish_partial();
+  else
+    finish(e.snapshot_id);
+  page_valid = true;
+  page_document = e.document_id;
+  page_snapshot = e.snapshot_id;
+  page_font_size = size;
+  page_index = index;
+  page_count = static_cast<int>(pages.size());
   {
     std::lock_guard<std::mutex> g(model.mutex);
     model.page = index;
@@ -585,6 +615,7 @@ void request_display_probe(int mode, int area, int count) {
 bool run_display_probe() {
   if (!probe_pending.exchange(false))
     return false;
+  invalidate_navigation();
   invalidate_navigation();
   auto &d = M5.Display;
   d.display();

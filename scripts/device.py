@@ -49,15 +49,39 @@ def main():
             port.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
             port.flush()
             payload.clear()
-            deadline = time.monotonic() + 35
+            # A command can queue behind an automatic sync; each network task
+            # has a 20-second budget. Leave time for both and USB scheduling.
+            deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
                 line = port.readline().decode("utf-8", errors="replace").strip()
-                # Show structured outcomes only; never echo a command or arbitrary device logs.
-                if line.startswith(("STATUS ", "RESULT ", "ERROR ")):
+                if line.startswith("ERROR "):
                     print(line)
-                    if line.startswith(("RESULT ", "STATUS ", "ERROR ")):
-                        return
-            sys.exit("设备未在 35 秒内返回结果，请查看屏幕或检查串口占用。")
+                    sys.exit(1)
+                kind, _, body = line.partition(" ")
+                if kind not in ("STATUS", "RESULT"):
+                    continue
+                try:
+                    result = json.loads(body)
+                except ValueError:
+                    continue
+                if not isinstance(result, dict):
+                    continue
+                # Automatic sync also emits RESULT. Only the response to our
+                # command may complete this operation.
+                if kind == "STATUS":
+                    if args.command != "status":
+                        continue
+                elif (
+                    args.command == "status"
+                    or result.get("command") != args.command
+                    or not isinstance(result.get("ok"), bool)
+                ):
+                    continue
+                print(line)
+                if kind == "RESULT" and not result["ok"]:
+                    sys.exit(1)
+                return
+            sys.exit("设备未在 60 秒内返回结果，请查看屏幕或检查串口占用。")
     except serial.SerialException:
         sys.exit("USB 连接失败或串口被占用，请关闭其他串口监视器后重试。")
 

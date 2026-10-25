@@ -1,4 +1,6 @@
 #include "readocs.hpp"
+#include "cache_file.hpp"
+#include "position_storage.hpp"
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -33,41 +35,14 @@ bool valid_hash(const std::string &s) {
 std::string read_file(const std::string &name, size_t limit) {
   if (name.find('/') != std::string::npos || name.size() > 70)
     return "";
-  FILE *f = std::fopen(("/cache/" + name).c_str(), "rb");
-  if (!f)
-    return "";
-  std::fseek(f, 0, SEEK_END);
-  long size = std::ftell(f);
-  std::rewind(f);
-  if (size < 0 || static_cast<size_t>(size) > limit) {
-    std::fclose(f);
-    return "";
-  }
-  std::string out(size, '\0');
-  size_t got = std::fread(out.data(), 1, size, f);
-  std::fclose(f);
-  return got == static_cast<size_t>(size) ? out : "";
+  return read_cache_file("/cache/" + name, limit);
 }
 bool write_file(const std::string &name, const std::string &body) {
   if (name.find('/') != std::string::npos || name.size() > 70)
     return false;
-  if (valid_hash(name) && sha256(read_file(name, body.size())) == name)
-    return true;
-  const std::string path = "/cache/" + name, temp = path + ".part";
-  FILE *f = std::fopen(temp.c_str(), "wb");
-  if (!f)
+  if (!valid_hash(name))
     return false;
-  bool ok = std::fwrite(body.data(), 1, body.size(), f) == body.size() &&
-            std::fflush(f) == 0;
-  if (ok)
-    ok = fsync(fileno(f)) == 0;
-  if (std::fclose(f) != 0)
-    ok = false;
-  if (ok)
-    ok = std::rename(temp.c_str(), path.c_str()) == 0;
-  if (!ok)
-    std::remove(temp.c_str());
-  return ok;
+  return publish_cache_file("/cache/" + name, body, name, sha256);
 }
 static std::string get_string(const char *key) {
   size_t size = 0;
@@ -79,6 +54,9 @@ static std::string get_string(const char *key) {
   if (!out.empty())
     out.pop_back();
   return out;
+}
+static std::string get_positions() {
+  return read_position_map(handle);
 }
 bool save_config(const Config &c) {
   Json root(cJSON_CreateObject());
@@ -276,31 +254,51 @@ void save_position(const Position &p) {
   cJSON_AddNumberToObject(j.get(), "offset", p.offset);
   cJSON_AddNumberToObject(j.get(), "page", p.page);
   auto s = serialize(j.get());
-  if (s == get_string("position"))
-    return;
-  Json all(cJSON_Parse(get_string("positions").c_str()));
+  Json all(cJSON_Parse(get_positions().c_str()));
   if (!all)
     all.reset(cJSON_CreateObject());
   cJSON_DeleteItemFromObjectCaseSensitive(all.get(), p.document.c_str());
   cJSON_AddItemToObject(all.get(), p.document.c_str(),
                         cJSON_Duplicate(j.get(), true));
-  while (cJSON_GetArraySize(all.get()) > 101)
-    cJSON_DeleteItemFromObjectCaseSensitive(all.get(), all->child->string);
   auto map = serialize(all.get());
-  if (nvs_set_str(handle, "position", s.c_str()) != ESP_OK ||
-      nvs_set_str(handle, "positions", map.c_str()) != ESP_OK ||
+  while (cJSON_GetArraySize(all.get()) > 1 &&
+         (cJSON_GetArraySize(all.get()) > 101 || map.size() > positions_limit)) {
+    cJSON_DeleteItemFromObjectCaseSensitive(all.get(), all->child->string);
+    map = serialize(all.get());
+  }
+  if (map == get_positions() && s == get_string("position"))
+    return;
+  // A string occupies one NVS page (at most 4000 bytes). Blobs span pages,
+  // allowing the complete per-document position map to survive a restart.
+  if (map.size() > positions_limit ||
+      write_position_map(handle, map) != ESP_OK ||
+      nvs_set_str(handle, "position", s.c_str()) != ESP_OK ||
       nvs_commit(handle) != ESP_OK)
     ESP_LOGW(TAG, "Position commit failed");
 }
 Position load_position(const std::string &doc) {
-  Json all(cJSON_Parse(get_string("positions").c_str()));
+  Json all(cJSON_Parse(get_positions().c_str()));
   auto *p = cJSON_GetObjectItemCaseSensitive(all.get(), doc.c_str());
   if (!cJSON_IsObject(p))
     return {};
   return {str(p, "document"), str(p, "block"), str(p, "snapshot"),
           static_cast<unsigned>(num(p, "offset")), num(p, "page")};
 }
-void collect_cache() {
+void collect_cache(bool reclaim_previous) {
+  if (reclaim_previous) {
+    // Reclaim an older fallback only after proving the current active index
+    // and every body it references are complete. The active index then stays
+    // pinned throughout downloads and becomes previous at the next commit.
+    const auto active = get_string("active");
+    std::vector<Entry> verified;
+    std::string etag;
+    if (active != get_string("previous") &&
+        load_index(active, verified, etag)) {
+      if (nvs_set_str(handle, "previous", active.c_str()) != ESP_OK ||
+          nvs_commit(handle) != ESP_OK)
+        ESP_LOGW(TAG, "Unable to reclaim previous cache version");
+    }
+  }
   std::set<std::string> keep;
   for (const char *key : {"active", "previous"}) {
     auto id = get_string(key);

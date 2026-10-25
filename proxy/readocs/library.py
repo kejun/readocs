@@ -208,12 +208,16 @@ class Library:
                         "UPDATE sources SET fetched=? WHERE id='feishu'", (time.time(),)
                     )
         for item in store.rows(
-            "SELECT * FROM feishu_items WHERE due<=? ORDER BY due,id LIMIT 1",
+            "SELECT i.*,d.updated AS content_updated_at FROM feishu_items i "
+            "LEFT JOIN documents d ON d.source_id='feishu' AND d.id=i.id "
+            "WHERE i.due<=? ORDER BY i.due,i.id LIMIT 1",
             (time.time(),),
         ):
             try:
                 async with asyncio.timeout(25):
-                    doc = await self.feishu.fetch(item["id"], item["url"])
+                    doc = await self.feishu.fetch(
+                        item["id"], item["url"], updated=item["content_updated_at"]
+                    )
             except (Problem, TimeoutError) as error:
                 if not self.current(source):
                     return
@@ -268,3 +272,4 @@ class Library:
                     source["generation"],
                 ),
             )
+        store.collect_snapshots()

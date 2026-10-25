@@ -1,4 +1,5 @@
 #include "cache_merge.hpp"
+#include "cache_policy.hpp"
 #include "readocs.hpp"
 #include <algorithm>
 #include <cstring>
@@ -14,11 +15,13 @@
 #include <esp_netif.h>
 #include <esp_netif_sntp.h>
 #include <esp_random.h>
+#include <esp_spiffs.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include <freertos/event_groups.h>
 #include <lwip/sockets.h>
 #include <sys/socket.h>
+#include <utility>
 
 namespace rd {
 static esp_netif_t *sta_netif, *ap_netif;
@@ -44,6 +47,19 @@ void enqueue(const std::string &type, const std::string &json) {
 static Config config_copy() {
   std::lock_guard<std::mutex> g(model.mutex);
   return model.config;
+}
+static std::pair<std::string, std::string> current_article() {
+  std::lock_guard<std::mutex> g(model.mutex);
+  return {model.current_source, model.current_document};
+}
+static void prepare_download_space() {
+  collect_cache();
+  size_t total = 0, used = 0;
+  // SPIFFS only guarantees about 75% usable space. Leave room for a body,
+  // directory transaction and filesystem GC before retaining older fallbacks.
+  if (esp_spiffs_info("cache", &total, &used) == ESP_OK &&
+      used + 1024 * 1024 > total * 3 / 4)
+    collect_cache(true);
 }
 static void wifi_event(void *, esp_event_base_t base, int32_t id, void *data) {
   if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -359,6 +375,31 @@ static bool save_directory_progress(const std::vector<Entry> &entries,
   }
   return true;
 }
+static void compact_directory_progress(const std::string &source,
+                                       const std::string &document) {
+  Json pending(cJSON_Parse(directory_progress().c_str()));
+  auto *array = cJSON_GetObjectItemCaseSensitive(pending.get(), "entries");
+  if (!cJSON_IsArray(array))
+    return;
+  std::vector<Entry> entries;
+  cJSON *item;
+  cJSON_ArrayForEach(item, array)
+      entries.push_back({str(item, "source_id"), str(item, "document_id"),
+                         str(item, "title"), str(item, "snapshot_id")});
+  auto compact = entries;
+  trim_cached_articles(compact, source, document);
+  if (compact == entries)
+    return;
+  // This also completes a migration interrupted after the active-index
+  // switch but before its old checkpoint was retired. Preserve pagination
+  // when space permits; otherwise restart only the directory scan.
+  if (!save_directory_progress(compact, str(pending.get(), "etag"),
+                               str(pending.get(), "directory_revision"),
+                               num(pending.get(), "source", -1),
+                               num(pending.get(), "cursor", -1)))
+    clear_directory_progress();
+  collect_cache(true);
+}
 static bool fetch_entry(const Config &c, Entry &entry) {
   Http response{{}, {}, 4096};
   if (!safe_id(entry.source_id) || !safe_id(entry.document_id) ||
@@ -394,6 +435,22 @@ static bool sync(bool manual) {
     etag = model.etag;
     old = model.entries;
   }
+  const auto selected = current_article();
+  if (!compact_cache_for_download(
+          old, selected.first, selected.second,
+          [&](const std::vector<Entry> &compact) {
+            if (!commit_cache(compact, etag))
+              return false;
+            std::lock_guard<std::mutex> g(model.mutex);
+            model.entries = compact;
+            redraw = true;
+            return true;
+          },
+          clear_directory_progress, [] { collect_cache(true); })) {
+    error_text = "缓存空间不足，旧版本已保留";
+    return false;
+  }
+  compact_directory_progress(selected.first, selected.second);
   Http out{{}, {}, 8192};
   int status = request(c, "/v1/sync", out, "", manual ? "" : etag);
   if (status != 200 && status != 304)
@@ -515,20 +572,22 @@ static bool sync(bool manual) {
       error_text = "目录数量不一致，请重新检查";
       return false;
     }
-    for (int i = 0; i < cJSON_GetArraySize(sources); ++i) {
-      auto sid = str(cJSON_GetArrayItem(sources, i), "id");
-      int prefetched = 0;
-      for (auto &e : entries) {
-        if (e.source_id != sid || prefetched++ >= 5)
-          continue;
-        if (std::find(unchanged_snapshots.begin(), unchanged_snapshots.end(),
-                      e.snapshot_id) != unchanged_snapshots.end() &&
-            valid_hash(e.snapshot_id) &&
-            sha256(read_file(e.snapshot_id)) == e.snapshot_id)
-          continue;
-        if (now_ms() + 1000 >= deadline || !fetch_entry(c, e))
-          complete = false;
+    const auto current = current_article();
+    const auto keep = cached_article_mask(entries, current.first, current.second);
+    prepare_download_space();
+    for (size_t i = 0; i < entries.size(); ++i) {
+      auto &e = entries[i];
+      if (!keep[i]) {
+        e.snapshot_id.clear();
+        continue;
       }
+      if (std::find(unchanged_snapshots.begin(), unchanged_snapshots.end(),
+                    e.snapshot_id) != unchanged_snapshots.end() &&
+          valid_hash(e.snapshot_id) &&
+          sha256(read_file(e.snapshot_id)) == e.snapshot_id)
+        continue;
+      if (now_ms() + 1000 >= deadline || !fetch_entry(c, e))
+        complete = false;
     }
     const auto saved_etag = complete ? out.etag : etag;
     if (!commit_cache(entries, saved_etag)) {
@@ -549,7 +608,32 @@ static bool sync(bool manual) {
       std::lock_guard<std::mutex> g(model.mutex);
       model.sync_pending = !complete;
     }
+    collect_cache(); // Release versions older than the committed fallback.
     redraw = true;
+  } else {
+    // The selected article may have changed since the last manifest was
+    // committed. Check it even on 304, including articles outside the prefetch
+    // set; a nonempty local reference must not make an old body permanent.
+    const auto current = current_article();
+    auto entries = old;
+    trim_cached_articles(entries, current.first, current.second);
+    auto selected =
+        std::find_if(entries.begin(), entries.end(), [&](const Entry &e) {
+          return e.source_id == current.first && e.document_id == current.second;
+        });
+    prepare_download_space();
+    if (selected != entries.end() && !fetch_entry(c, *selected))
+      return false;
+    if (!commit_cache(entries, etag)) {
+      error_text = "缓存保存失败，旧版本已保留";
+      return false;
+    }
+    if (entries != old) {
+      std::lock_guard<std::mutex> g(model.mutex);
+      model.entries = entries;
+      redraw = true;
+    }
+    collect_cache();
   }
   if (manual) {
     Http refresh{{}, {}, 2048};
@@ -595,23 +679,22 @@ static bool download_article(const cJSON *input) {
       });
   if (selected == entries.end())
     return false;
+  prepare_download_space();
   if (!fetch_entry(c, *selected) || selected->snapshot_id.empty()) {
     error_text = "正文尚未同步，请稍后重试";
     return false;
   }
-  int kept = 0;
-  for (auto &e : entries)
-    if (e.source_id == source && e.document_id != doc &&
-        !e.snapshot_id.empty()) {
-      if (++kept > 5)
-        e.snapshot_id.clear();
-    }
+  // Selection can change while the queued download is running. Keep both the
+  // displayed selection and its just-completed request until the next sync.
+  const auto current = current_article();
+  trim_cached_articles(entries, current.first, current.second, source, doc);
   if (!commit_cache(entries, etag))
     return false;
   {
     std::lock_guard<std::mutex> g(model.mutex);
     model.entries = entries;
   }
+  collect_cache();
   set_status("正文已下载");
   return true;
 }
@@ -819,6 +902,10 @@ static void status_console() {
                           display_partial_count());
   cJSON_AddNumberToObject(j.get(), "partial_limit",
                           display_partial_limit());
+  cJSON_AddNumberToObject(j.get(), "pm1_btn_cfg1", pm1_register(0x49));
+  cJSON_AddNumberToObject(j.get(), "pm1_btn_cfg2", pm1_register(0x4A));
+  cJSON_AddNumberToObject(j.get(), "pm1_btn_irq", pm1_register(0x42));
+  cJSON_AddNumberToObject(j.get(), "pm1_btn_mask", pm1_register(0x45));
   cJSON_AddNumberToObject(j.get(), "heap", esp_get_free_heap_size());
   cJSON_AddNumberToObject(
       j.get(), "internal_heap",

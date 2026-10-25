@@ -8,6 +8,21 @@ int main() {
   auto emit = [&](Key k) { events.push_back(k); };
   {
     InputLogic b;
+    assert(b.idle());
+    b.update(1, 5, emit);
+    assert(!b.idle());
+    b.update(1, 30, emit);
+    b.update(0, 35, emit);
+    b.update(0, 50, emit);
+    // The electrical level is released, but sleeping now would lose a valid
+    // short press whose release has not finished debouncing.
+    assert(!b.idle() && events.empty());
+    b.update(0, 60, emit);
+    assert(b.idle() && events == std::vector<Key>{Key::Next});
+    events.clear();
+  }
+  {
+    InputLogic b;
     b.update(1, 0, emit);
     b.update(0, 10, emit);
     b.update(0, 40, emit);

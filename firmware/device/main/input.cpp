@@ -4,6 +4,8 @@
 #include <esp_sleep.h>
 
 namespace rd {
+std::atomic<bool> input_idle{false};
+
 void input_task(void *) {
   gpio_config_t cfg{};
   cfg.pin_bit_mask = (1ULL << 3) | (1ULL << 4);
@@ -23,11 +25,17 @@ void input_task(void *) {
       emit(cause == (1ULL << 4) ? Key::Next : Key::Previous);
   }
   InputLogic input;
+  int64_t next_power_poll = 0;
   while (true) {
     auto raw = sample();
     if (raw)
       last_input = now_ms();
     input.update(raw, now_ms(), emit);
+    input_idle.store(input.idle());
+    if (now_ms() >= next_power_poll) {
+      next_power_poll = now_ms() + 10;
+      power_key_poll();
+    }
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }

@@ -12,6 +12,11 @@ class InputLogic {
   bool combo = false, combo_sent = false;
 
 public:
+  bool idle() const {
+    return candidate == 0 && stable == 0 && held == 0 && latched == 0 &&
+           !combo;
+  }
+
   template <typename Emit> void update(unsigned raw, int64_t now, Emit emit) {
     if (raw != candidate) {
       candidate = raw;

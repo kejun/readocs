@@ -8,6 +8,8 @@ import zlib
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
+from aiohttp.helpers import get_env_proxy_for_url
+from yarl import URL
 
 from .errors import Problem
 
@@ -70,8 +72,63 @@ class PublicResolver(aiohttp.abc.AbstractResolver):
         pass
 
 
+async def proxy_target(url, headers):
+    """Use trusted machine proxy settings without delegating target DNS to it."""
+    original = URL(url)
+    try:
+        proxy, auth = get_env_proxy_for_url(original)
+    except LookupError:
+        return original, headers, {}
+    if proxy.scheme != "http" or not proxy.raw_host:
+        raise Problem(
+            "UPSTREAM_PROXY_UNSUPPORTED", "本机出站代理需使用 HTTP 代理地址", 502
+        )
+
+    # CONNECT and HTTP absolute-form requests must address the validated IP.
+    # Merely checking DNS and then sending the hostname lets the proxy resolve
+    # it again to a different, potentially private, destination.
+    addresses = await PublicResolver().resolve(
+        original.raw_host, original.port, socket.AF_UNSPEC
+    )
+    address = next(
+        (row for row in addresses if row["family"] == socket.AF_INET), addresses[0]
+    )["host"]
+    target = original.with_host(address)
+
+    # A configured proxy may itself be on localhost or a private network. Resolve
+    # it separately as trusted configuration; the public target stays pinned.
+    try:
+        ipaddress.ip_address(proxy.raw_host)
+    except ValueError:
+        records = await asyncio.get_running_loop().getaddrinfo(
+            proxy.raw_host, proxy.port, type=socket.SOCK_STREAM
+        )
+        if not records:
+            raise Problem("UPSTREAM_TIMEOUT", "无法连接本机配置的出站代理", 502)
+        record = next((row for row in records if row[0] == socket.AF_INET), records[0])
+        proxy = proxy.with_host(record[4][0])
+    return (
+        target,
+        {**headers, "Host": original.host_port_subcomponent},
+        {
+            "proxy": proxy,
+            "proxy_auth": auth,
+            "server_hostname": original.raw_host
+            if original.scheme == "https"
+            else None,
+        },
+    )
+
+
 class Network:
-    async def request(self, method, url, *, headers=None, data=None):
+    async def request(self, method, url, *, headers=None, data=None, max_bytes=LIMIT):
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        limit_label = (
+            f"{max_bytes / (1024 * 1024):g} MiB"
+            if max_bytes >= 1024 * 1024
+            else f"{max_bytes} 字节"
+        )
         headers = {
             "User-Agent": "Readocs/0.1",
             "Accept-Encoding": "gzip, deflate",
@@ -91,12 +148,16 @@ class Network:
                 ) as session:
                     for _ in range(6):
                         validate_url(url)
+                        target, request_headers, proxy_options = await proxy_target(
+                            url, headers
+                        )
                         async with session.request(
                             method,
-                            url,
-                            headers=headers,
+                            target,
+                            headers=request_headers,
                             data=data,
                             allow_redirects=False,
+                            **proxy_options,
                         ) as r:
                             if r.status in (301, 302, 303, 307, 308):
                                 target = urljoin(url, r.headers.get("Location", ""))
@@ -112,6 +173,9 @@ class Network:
                                     )
                                 url = target
                                 continue
+                            # Representation headers may describe a body omitted by HTTP.
+                            if method.upper() == "HEAD" or r.status in (204, 304):
+                                return r.status, dict(r.headers), b""
                             encoding = r.headers.get(
                                 "Content-Encoding", "identity"
                             ).lower()
@@ -128,19 +192,19 @@ class Network:
                             async for chunk in r.content.iter_chunked(16384):
                                 total += len(chunk)
                                 chunk = (
-                                    inflater.decompress(chunk, LIMIT - expanded + 1)
+                                    inflater.decompress(chunk, max_bytes - expanded + 1)
                                     if inflater
                                     else chunk
                                 )
                                 expanded += len(chunk)
                                 if (
-                                    total > LIMIT
-                                    or expanded > LIMIT
+                                    total > max_bytes
+                                    or expanded > max_bytes
                                     or (inflater and inflater.unconsumed_tail)
                                 ):
                                     raise Problem(
                                         "CONTENT_TOO_LARGE",
-                                        "源内容超过 2 MiB 限制",
+                                        f"源内容超过 {limit_label} 限制",
                                         422,
                                     )
                                 chunks.append(chunk)

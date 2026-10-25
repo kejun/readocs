@@ -8,6 +8,7 @@
 #include <esp_log.h>
 #include <esp_ota_ops.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include <nvs_flash.h>
@@ -28,26 +29,37 @@ static RTC_DATA_ATTR int64_t next_sync_at = 0;
 static RTC_DATA_ATTR unsigned failure_count = 0;
 static bool sleeping = false;
 
-static bool ready_to_leave_ui() {
-  if (networking || sleeping)
-    return false;
-  bool ap;
-  {
-    std::lock_guard<std::mutex> g(model.mutex);
-    ap = model.ap;
-  }
-  if (ap)
-    return false;
-  if (gpio_get_level(GPIO_NUM_3) == 0 || gpio_get_level(GPIO_NUM_4) == 0)
-    return false;
-  vTaskDelay(pdMS_TO_TICKS(50));
+static bool keys_released() {
   return gpio_get_level(GPIO_NUM_3) != 0 &&
          gpio_get_level(GPIO_NUM_4) != 0;
 }
 
-static void sleep_now() {
-  if (!ready_to_leave_ui())
+static bool ui_idle() {
+  if (networking || !input_idle.load() || !keys_released() ||
+      uxQueueMessagesWaiting(buttons) > 0 ||
+      uxQueueMessagesWaiting(actions) > 0)
+    return false;
+  std::lock_guard<std::mutex> g(model.mutex);
+  return !model.ap;
+}
+
+static bool ready_to_leave_ui(bool require_idle = false) {
+  if (sleeping || !ui_idle())
+    return false;
+  const auto before = last_input.load();
+  if (require_idle && now_ms() - before < 250)
+    return false;
+  // A short press can start and end inside this window while its release is
+  // still being debounced. Check the gesture state and activity again, rather
+  // than treating a high GPIO at the end as a stable release.
+  vTaskDelay(pdMS_TO_TICKS(50));
+  return last_input.load() == before && !sleeping && ui_idle();
+}
+
+static void sleep_now(bool show_cover = false, bool require_idle = false) {
+  if (!ready_to_leave_ui(require_idle))
     return;
+  const auto before = last_input.load();
   unsigned interval;
   {
     std::lock_guard<std::mutex> g(model.mutex);
@@ -55,9 +67,23 @@ static void sleep_now() {
   }
   sleeping = true;
   esp_wifi_stop();
-  M5.Display.waitDisplay();
-  // Keep the e-paper image; driver state will be rebuilt with a full refresh
-  // when needed.
+  if (show_cover) {
+    // Explicit standby shows the shutdown cover; auto-sleep keeps the current
+    // reading page so a one-second idle does not hide the text.
+    draw_cover();
+    retained_view = static_cast<int>(View::Reading);
+  } else {
+    M5.Display.waitDisplay();
+    // Keep the e-paper image; driver state will be rebuilt with a full refresh
+    // when needed.
+  }
+  // Drawing a cover can take seconds. Let any input or queued operation that
+  // arrived during the waveform return to the UI before entering deep sleep.
+  if (last_input.load() != before || !ui_idle()) {
+    sleeping = false;
+    return;
+  }
+  power_key_prepare_sleep();
   M5.Display.sleep();
   ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup_io((1ULL << 3) | (1ULL << 4),
                                                   ESP_EXT1_WAKEUP_ANY_LOW));
@@ -72,18 +98,22 @@ static void sleep_now() {
   esp_deep_sleep_start();
 }
 
-static void shutdown_now() {
-  if (!ready_to_leave_ui())
-    return;
+static void power_off_now() {
   sleeping = true;
   esp_wifi_stop();
   // The image is retained by the e-paper panel, so it must be drawn before the
   // PM1 cuts power.
   draw_cover();
   ESP_LOGI("readocs", "shutdown cover ready, cutting power");
-  M5.Power.powerOff();
+  power_key_shutdown();
   while (true)
     vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+static void shutdown_now() {
+  if (!ready_to_leave_ui())
+    return;
+  power_off_now();
 }
 } // namespace rd
 extern "C" void app_main() {
@@ -102,6 +132,8 @@ extern "C" void app_main() {
   }
   M5.Display.setAutoDisplay(false);
   M5.Display.setEpdMode(m5gfx::epd_mode_t::epd_quality);
+  ESP_LOGI("readocs", "reset reason=%d", static_cast<int>(esp_reset_reason()));
+  configure_power_key();
   const bool storage_ok = load_storage();
   actions = xQueueCreate(8, sizeof(Action *));
   buttons = xQueueCreate(32, sizeof(Key));
@@ -157,6 +189,7 @@ extern "C" void app_main() {
     current = e;
     {
       std::lock_guard<std::mutex> g(model.mutex);
+      model.current_source = e.source_id;
       model.current_document = e.document_id;
     }
     if (e.snapshot_id.empty()) {
@@ -209,6 +242,10 @@ extern "C" void app_main() {
   bool previous_busy = false, ap_was = false;
   int64_t last_check = 0;
   while (true) {
+    if (power_off_requested.exchange(false)) {
+      ESP_LOGI("readocs", "PM1 power key double-click");
+      power_off_now();
+    }
     if (run_display_probe())
       need_draw = true;
     std::string status, ssid, ap_ssid, ap_password;
@@ -241,7 +278,7 @@ extern "C" void app_main() {
     if (previous_busy && !networking) {
       next_sync_at = std::time(nullptr) +
                      (sync_pending ? 60
-                                   : (M5.Power.M5pm1.getVBUSVoltage() > 4000
+                                   : (pm1_vbus_voltage() > 4000
                                           ? 300
                                           : config.interval));
       if (status == "已同步" || sync_pending)
@@ -276,6 +313,9 @@ extern "C" void app_main() {
     while (xQueueReceive(buttons, &event, 0) == pdTRUE) {
       handled = true;
       list_touched = true;
+      const int64_t lag = now_ms() - last_input;
+      if (lag > 250)
+        ESP_LOGI("readocs", "key lag=%lld ms", static_cast<long long>(lag));
       last_input = now_ms();
       if (event == Key::PairConfirm) {
         view = View::Pair;
@@ -343,7 +383,7 @@ extern "C" void app_main() {
           } else if (selected == 4)
             view = View::Pair;
           else if (selected == 5)
-            sleep_now();
+            sleep_now(true);
           else
             shutdown_now();
           need_draw = true;
@@ -466,16 +506,17 @@ extern "C" void app_main() {
       std::snprintf(retained_document, sizeof(retained_document), "%s",
                     current.document_id.c_str());
     }
-    const bool usb = M5.Power.M5pm1.getVBUSVoltage() > 4000;
+    const bool usb = pm1_vbus_voltage() > 4000;
     if (!ap && !networking && now_ms() - last_input >= 1000) {
-      if (quality_cleanup_due()) {
+      if (keys_released() && uxQueueMessagesWaiting(buttons) == 0 &&
+          quality_cleanup_due()) {
         request_quality_cleanup();
         need_draw = true;
         last_input = now_ms();
         continue;
       }
       if (!usb)
-        sleep_now();
+        sleep_now(false, true);
     }
     if (usb && !ap && !networking && std::time(nullptr) >= next_sync_at &&
         config.token.size()) {

@@ -85,6 +85,8 @@ def create_app(directory=None, network=None, background=True, device_prefix=""):
     )
     app.state.store, app.state.worker, app.state.feishu = store, worker, feishu
     failed_logins = {}
+    # Includes removals, even when no config exists, to fence absent -> absent races.
+    feishu_config_revision = 0
 
     @app.exception_handler(Problem)
     async def problem_handler(request, e):
@@ -290,9 +292,14 @@ def create_app(directory=None, network=None, background=True, device_prefix=""):
 
     @app.put("/api/feishu", dependencies=[Depends(admin)])
     async def save_feishu(payload: FeishuConfig):
+        nonlocal feishu_config_revision
+        revision = feishu_config_revision
+        old = store.get("feishu", {})
         secret = credentials(payload)
         result = await feishu.exchange(payload.app_id.strip(), secret)
-        old = store.get("feishu", {})
+        if revision != feishu_config_revision:
+            raise Problem("CONFIG_CHANGED", "飞书配置已变更，请重新保存", 409)
+        feishu_config_revision += 1
         # Fence removed/re-created configurations against old in-flight requests too.
         generation = time.time_ns()
         changed = (
@@ -431,6 +438,8 @@ def create_app(directory=None, network=None, background=True, device_prefix=""):
 
     @app.delete("/api/feishu", dependencies=[Depends(admin)])
     async def remove_feishu():
+        nonlocal feishu_config_revision
+        feishu_config_revision += 1
         with store.db:
             store.db.execute(
                 "DELETE FROM settings WHERE key IN ('feishu','feishu_user')"

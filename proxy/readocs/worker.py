@@ -2,7 +2,7 @@ import asyncio
 import random
 import time
 
-from .content import parse_feed
+from .content import FEED_MAX_BYTES, FeedIdentities, parse_feed
 from .errors import Problem
 from .library import Library
 
@@ -16,20 +16,22 @@ class Worker:
     async def fetch(self, source):
         sid = source["id"]
         config = self.store.decrypt(source["config"])
-        headers, status = {}, 200
+        headers, status, identities = {}, 200, None
         if source["kind"] == "feishu":
             await self.library.fetch(source)
             return
         else:
             request_headers = {}
-            if source["upstream_etag"]:
+            if source["feed_members_known"] and source["upstream_etag"]:
                 request_headers["If-None-Match"] = source["upstream_etag"]
-            if source["upstream_modified"]:
+            if source["feed_members_known"] and source["upstream_modified"]:
                 request_headers["If-Modified-Since"] = source["upstream_modified"]
             status, headers, body = await self.network.request(
-                "GET", config["url"], headers=request_headers
+                "GET", config["url"], headers=request_headers, max_bytes=FEED_MAX_BYTES
             )
             if status == 304:
+                if not source["feed_members_known"]:
+                    raise Problem("PARSE_ERROR", "订阅源缺少可复用的完整检查结果", 502)
                 title, docs = source["title"], []
             elif status == 429:
                 try:
@@ -47,17 +49,58 @@ class Worker:
             elif status != 200:
                 raise Problem("UPSTREAM_TIMEOUT", "订阅源暂时不可用", 502)
             else:
-                title, docs = parse_feed(body, sid)
+                identities = FeedIdentities(
+                    self.store.rows(
+                        "SELECT document_id,title,fingerprint,updated FROM feed_fallbacks WHERE source_id=?",
+                        (sid,),
+                    )
+                )
+                title, docs = parse_feed(body, sid, identities=identities)
         # A config edit or credential rotation invalidates an in-flight result.
         latest = self.store.source(sid)
         if not latest or latest["generation"] != source["generation"]:
             return
         with self.store.db:
-            for doc in reversed(docs):
+            if status == 304:
+                self.store.db.execute(
+                    "UPDATE documents SET seen=? WHERE source_id=? AND id IN "
+                    "(SELECT document_id FROM feed_members WHERE source_id=?)",
+                    (time.time(), sid, sid),
+                )
+                self.store.db.execute(
+                    "UPDATE feed_fallbacks SET seen=? WHERE source_id=? AND document_id IN "
+                    "(SELECT document_id FROM feed_members WHERE source_id=?)",
+                    (time.time(), sid, sid),
+                )
+            else:
+                self.store.db.execute(
+                    "DELETE FROM feed_members WHERE source_id=?", (sid,)
+                )
+                self.store.db.executemany(
+                    "INSERT INTO feed_members VALUES(?,?)",
+                    [(sid, did) for did in identities.members],
+                )
+                self.store.db.executemany(
+                    "INSERT INTO feed_fallbacks VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(source_id,document_id) DO UPDATE SET title=excluded.title,"
+                    "fingerprint=excluded.fingerprint,updated=excluded.updated,seen=excluded.seen",
+                    [
+                        (
+                            sid,
+                            row["document_id"],
+                            row["title"],
+                            row["fingerprint"],
+                            row["updated"],
+                            time.time(),
+                        )
+                        for row in identities.records
+                    ],
+                )
+            for doc in docs:
                 self.store.save_snapshot(sid, doc)
             self.store.db.execute(
                 "UPDATE sources SET title=?,checked=?,fetched=?,due=?,error=NULL,failures=0,"
-                "upstream_etag=?,upstream_modified=? WHERE id=?",
+                "upstream_etag=?,upstream_modified=?,feed_members_known=1 WHERE id=?",
                 (
                     title,
                     time.time(),

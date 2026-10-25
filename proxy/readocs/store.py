@@ -8,7 +8,9 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
-from .dates import article_order
+from .dates import article_order, upstream_time
+
+DOWNLOAD_LEASE = 86400
 
 
 def canonical(value) -> bytes:
@@ -84,12 +86,55 @@ class Store:
         CREATE TABLE IF NOT EXISTS oauth_states(
           hash TEXT PRIMARY KEY, session_hash TEXT NOT NULL, generation INTEGER NOT NULL,
           redirect TEXT NOT NULL, expires REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS feed_members(
+          source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+          document_id TEXT NOT NULL, PRIMARY KEY(source_id,document_id));
+        CREATE TABLE IF NOT EXISTS feed_fallbacks(
+          source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+          document_id TEXT NOT NULL, title TEXT NOT NULL, fingerprint TEXT NOT NULL,
+          updated TEXT, seen REAL NOT NULL, PRIMARY KEY(source_id,document_id));
+        CREATE TABLE IF NOT EXISTS snapshot_leases(
+          snapshot_id TEXT PRIMARY KEY REFERENCES snapshots(id) ON DELETE CASCADE,
+          lease_until REAL NOT NULL DEFAULT 0, retired_at REAL);
         UPDATE jobs SET state='queued' WHERE state='running';
         """)
         if "created" not in {
             row["name"] for row in self.db.execute("PRAGMA table_info(documents)")
         }:
             self.db.execute("ALTER TABLE documents ADD COLUMN created TEXT")
+        if "feed_members_known" not in {
+            row["name"] for row in self.db.execute("PRAGMA table_info(sources)")
+        }:
+            # The old database cannot distinguish current members from retained history.
+            # Fetch one unconditional response before accepting conditional checks.
+            self.db.execute(
+                "ALTER TABLE sources ADD COLUMN feed_members_known INTEGER NOT NULL DEFAULT 0"
+            )
+        # Recover the previous title-based fallback IDs where they can be identified.
+        # No private runtime database is rewritten outside the normal Store migration.
+        for row in self.rows(
+            "SELECT d.*,p.body FROM documents d JOIN sources s ON s.id=d.source_id "
+            "LEFT JOIN snapshots p ON p.id=d.snapshot_id WHERE s.kind='rss' "
+            "AND NOT EXISTS (SELECT 1 FROM feed_fallbacks f WHERE f.source_id=d.source_id AND f.document_id=d.id)"
+        ):
+            legacy = digest((row["source_id"] + "\0fallback:" + row["title"]).encode())[
+                :32
+            ]
+            if row["id"] != legacy:
+                continue
+            blocks = json.loads(row["body"])["blocks"] if row["body"] else []
+            fingerprint = digest(canonical([b["text"] for b in blocks]))
+            self.db.execute(
+                "INSERT INTO feed_fallbacks VALUES(?,?,?,?,?,?)",
+                (
+                    row["source_id"],
+                    row["id"],
+                    row["title"],
+                    fingerprint,
+                    row["updated"],
+                    row["seen"],
+                ),
+            )
         self.db.commit()
 
     def encrypt(self, value):
@@ -126,10 +171,18 @@ class Store:
             "WHERE d.source_id=? AND d.id=?",
             (sid, doc["document_id"]),
         ).fetchone()
+        previous = json.loads(existing["body"]) if existing else None
+        # Repair legacy snapshots without mutating their immutable bytes. Later
+        # metadata-only date changes still leave an existing dated version alone.
+        missing_date = (
+            previous
+            and previous.get("content_updated_at") is None
+            and upstream_time(doc.get("content_updated_at")) is not None
+        )
         if (
-            existing
-            and json.loads(existing["body"])["content_revision"]
-            == doc["content_revision"]
+            previous
+            and previous["content_revision"] == doc["content_revision"]
+            and not missing_date
         ):
             self.db.execute(
                 "UPDATE documents SET seen=?,updated=COALESCE(?,updated) WHERE source_id=? AND id=?",
@@ -137,7 +190,7 @@ class Store:
             )
             return existing["id"]
         self.db.execute(
-            "INSERT OR IGNORE INTO snapshots VALUES(?,?,?,?,?)",
+            "INSERT OR IGNORE INTO snapshots(id,source_id,document_id,body,created) VALUES(?,?,?,?,?)",
             (snapshot_id, sid, doc["document_id"], body, time.time()),
         )
         self.db.execute(
@@ -177,6 +230,12 @@ class Store:
         if not row:
             return None
         body = row[0]
+        with self.db:
+            self.db.execute(
+                "INSERT INTO snapshot_leases(snapshot_id,lease_until) VALUES(?,?) "
+                "ON CONFLICT(snapshot_id) DO UPDATE SET lease_until=MAX(lease_until,excluded.lease_until)",
+                (snapshot_id, time.time() + DOWNLOAD_LEASE),
+            )
         return {
             "snapshot_id": snapshot_id,
             "bytes": len(body),
@@ -278,25 +337,52 @@ class Store:
     def prune(self, sid):
         # Directory and body quotas are independent. Disappearance from a feed is not deletion.
         rows = self.rows(
-            "SELECT id,seen FROM documents WHERE source_id=? ORDER BY seen DESC,id",
+            "SELECT id AS document_id,title,updated AS content_updated_at,seen "
+            "FROM documents WHERE source_id=?",
             (sid,),
         )
+        rows.sort(key=article_order)
         now = time.time()
         with self.db:
-            for i, row in enumerate(rows):
-                if i >= 50 or now - row["seen"] > 7 * 86400:
+            retained = 0
+            for row in rows:
+                if retained >= 50 or now - row["seen"] > 7 * 86400:
                     self.db.execute(
                         "DELETE FROM documents WHERE source_id=? AND id=?",
-                        (sid, row["id"]),
+                        (sid, row["document_id"]),
                     )
-                elif i >= 20:
-                    self.db.execute(
-                        "UPDATE documents SET snapshot_id=NULL WHERE source_id=? AND id=?",
-                        (sid, row["id"]),
-                    )
-            # Immutable snapshots have a minimum 24-hour download lease even after replacement.
+                else:
+                    if retained >= 20:
+                        self.db.execute(
+                            "UPDATE documents SET snapshot_id=NULL WHERE source_id=? AND id=?",
+                            (sid, row["document_id"]),
+                        )
+                    retained += 1
             self.db.execute(
-                "DELETE FROM snapshots WHERE created<? AND id NOT IN "
+                "DELETE FROM feed_fallbacks WHERE source_id=? AND seen<?",
+                (sid, now - 7 * 86400),
+            )
+        self.collect_snapshots()
+
+    def collect_snapshots(self):
+        now = time.time()
+        with self.db:
+            # Start retention when an active reference disappears, rather than
+            # when the snapshot was created (possibly months before its download).
+            self.db.execute(
+                "INSERT OR IGNORE INTO snapshot_leases(snapshot_id) SELECT id FROM snapshots"
+            )
+            self.db.execute(
+                "UPDATE snapshot_leases SET retired_at=NULL WHERE snapshot_id IN "
+                "(SELECT snapshot_id FROM documents WHERE snapshot_id IS NOT NULL)"
+            )
+            self.db.execute(
+                "UPDATE snapshot_leases SET retired_at=? WHERE retired_at IS NULL AND snapshot_id NOT IN "
                 "(SELECT snapshot_id FROM documents WHERE snapshot_id IS NOT NULL)",
-                (now - 86400,),
+                (now,),
+            )
+            self.db.execute(
+                "DELETE FROM snapshots WHERE id IN "
+                "(SELECT snapshot_id FROM snapshot_leases WHERE retired_at<=? AND lease_until<=?)",
+                (now - DOWNLOAD_LEASE, now),
             )

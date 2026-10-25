@@ -1,0 +1,89 @@
+#pragma once
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
+#ifdef ESP_PLATFORM
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
+
+namespace rd {
+inline constexpr size_t cache_read_chunk = 4096;
+inline void cache_read_yield() {
+#ifdef ESP_PLATFORM
+  // A yield to another ready task does not let IDLE run. Block for one tick
+  // between filesystem reads so IDLE can service its watchdog subscription.
+  vTaskDelay(1);
+#endif
+}
+
+template <typename Yield>
+std::string read_cache_file(const std::string &path, size_t limit,
+                            Yield cooperate) {
+  FILE *f = std::fopen(path.c_str(), "rb");
+  if (!f)
+    return "";
+  // Seeking to EOF makes SPIFFS locate the last object-index span and then
+  // locate the first span again on rewind. fstat reads the open descriptor's
+  // size without either full lookup.
+  struct stat info{};
+  if (fstat(fileno(f), &info) != 0 || info.st_size < 0 ||
+      static_cast<size_t>(info.st_size) > limit) {
+    std::fclose(f);
+    return "";
+  }
+  const size_t size = static_cast<size_t>(info.st_size);
+  std::string out(size, '\0');
+  size_t got = 0;
+  while (got < size) {
+    cooperate();
+    const size_t count = std::min(cache_read_chunk, size - got);
+    if (std::fread(out.data() + got, 1, count, f) != count) {
+      std::fclose(f);
+      return ""; // Never publish or validate an incomplete cache read.
+    }
+    got += count;
+  }
+  std::fclose(f);
+  return out;
+}
+
+inline std::string read_cache_file(const std::string &path, size_t limit) {
+  return read_cache_file(path, limit, cache_read_yield);
+}
+
+template <typename Digest>
+bool publish_cache_file(const std::string &path, const std::string &body,
+                        const std::string &digest, Digest hash) {
+  if (hash(body) != digest)
+    return false;
+  if (hash(read_cache_file(path, body.size())) == digest)
+    return true;
+  const std::string temp = path + ".part";
+  FILE *f = std::fopen(temp.c_str(), "wb");
+  if (!f)
+    return false;
+  bool ok = std::fwrite(body.data(), 1, body.size(), f) == body.size() &&
+            std::fflush(f) == 0;
+  if (ok)
+    ok = fsync(fileno(f)) == 0;
+  if (std::fclose(f) != 0)
+    ok = false;
+  if (ok)
+    ok = hash(read_cache_file(temp, body.size())) == digest;
+  // SPIFFS cannot rename over an existing object. Only a verified-bad target
+  // may be removed, and only after its replacement is durable and verified.
+  // An interruption leaves a valid old object or a recoverable missing object.
+  if (ok && hash(read_cache_file(path, body.size())) != digest &&
+      std::remove(path.c_str()) != 0 && errno != ENOENT)
+    ok = false;
+  if (ok)
+    ok = std::rename(temp.c_str(), path.c_str()) == 0;
+  if (!ok)
+    std::remove(temp.c_str());
+  return ok;
+}
+} // namespace rd

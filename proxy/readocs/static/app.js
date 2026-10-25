@@ -9,6 +9,8 @@ const el = (tag, cls, text) => {
 let state = null,
   selectedSource = null,
   previewId = null,
+  sourceRequestId = 0,
+  previewRequestId = 0,
   fontSize = 18,
   polling = null,
   activeRequests = 0;
@@ -19,6 +21,7 @@ const messages = {
   APP_CREDENTIALS_INVALID: "应用凭据无效 · 请检查飞书配置",
   UPSTREAM_AUTH_REQUIRED: "需要修复飞书授权",
   UPSTREAM_TIMEOUT: "暂时无法连接 · 旧内容已保留",
+  UPSTREAM_PROXY_UNSUPPORTED: "本机代理配置不受支持 · 请使用 HTTP 代理地址",
   PARSE_ERROR: "源格式无法解析 · 请检查订阅地址",
   SOURCE_GONE: "源不可用 · 旧内容已保留",
   CONTENT_TOO_LARGE: "内容超过首版处理限制",
@@ -55,6 +58,7 @@ function notify(text) {
   notify.timer = setTimeout(() => ($("#notice").hidden = true), 3500);
 }
 function showLogin() {
+  clearSource();
   $("#shell").hidden = true;
   $("#login").hidden = false;
   if (polling) {
@@ -131,6 +135,8 @@ async function loadState(initial = false) {
   return data;
 }
 function renderSources() {
+  if (selectedSource && !state.sources.some((s) => s.id === selectedSource))
+    clearSource();
   const list = $("#source-list");
   const opened = new Set(
     [...list.querySelectorAll("details[open]")].map((d) => d.dataset.sourceId),
@@ -248,16 +254,27 @@ function renderDevices() {
     list.append(row);
   }
 }
+function clearSource() {
+  sourceRequestId++;
+  selectedSource = null;
+  $("#article-panel").hidden = true;
+  $("#article-list").replaceChildren();
+  clearPreview();
+}
 function clearPreview() {
+  previewRequestId++;
   previewId = null;
   $("#reader").hidden = true;
   $("#reader-placeholder").hidden = false;
-  $("#reader-meta").textContent = "";
+  $("#reader-meta").replaceChildren();
 }
 async function openSource(source) {
+  clearSource();
+  const requestId = sourceRequestId;
   selectedSource = source.id;
   try {
     const result = await api("/api/sources/" + source.id + "/documents");
+    if (requestId !== sourceRequestId || selectedSource !== source.id) return;
     $("#article-source").textContent = source.title;
     $("#article-source").hidden = state.sources.length === 1;
     $("#article-panel .list-heading").classList.toggle(
@@ -289,10 +306,11 @@ async function openSource(source) {
     if (first)
       await openDocument(first, list.children[result.documents.indexOf(first)]);
   } catch (e) {
-    notify(e.message);
+    if (requestId === sourceRequestId) notify(e.message);
   }
 }
 function appendDocuments(result, list, sourceId) {
+  const requestId = sourceRequestId;
   for (const d of result.documents) {
     const b = el("button", "article-row", d.title);
     if (d.sync_error)
@@ -311,18 +329,22 @@ function appendDocuments(result, list, sourceId) {
           const next = await api(
             `/api/sources/${sourceId}/documents?cursor=${result.next_cursor}`,
           );
-          if (selectedSource !== sourceId) return;
+          if (requestId !== sourceRequestId || selectedSource !== sourceId) return;
           more.remove();
           appendDocuments(next, list, sourceId);
         } catch (e) {
-          notify(e.message);
+          if (requestId === sourceRequestId) notify(e.message);
         }
       });
     list.append(more);
   }
 }
 async function openDocument(doc, button) {
+  const requestId = ++previewRequestId;
+  const sourceId = selectedSource;
   if (!doc.snapshot_id) {
+    clearPreview();
+    renderReaderMeta(doc);
     notify(
       selectedSource === "feishu"
         ? "正文尚未同步，请稍后重试"
@@ -332,6 +354,7 @@ async function openDocument(doc, button) {
   }
   try {
     const data = await api("/api/preview/" + doc.snapshot_id);
+    if (requestId !== previewRequestId || selectedSource !== sourceId) return;
     previewId = doc.snapshot_id;
     const reader = $("#reader");
     reader.replaceChildren(el("h1", "", data.title));
@@ -362,19 +385,32 @@ async function openDocument(doc, button) {
     reader.style.fontSize = fontSize + "px";
     reader.hidden = false;
     $("#reader-placeholder").hidden = true;
-    $("#reader-meta").textContent = [
-      data.summary ? "摘要" : "",
-      data.truncated ? "内容已截断" : "",
-    ]
-      .filter(Boolean)
-      .join(" · ");
+    renderReaderMeta(data);
     document
       .querySelectorAll(".article-row")
       .forEach((b) => b.removeAttribute("aria-current"));
     button?.setAttribute("aria-current", "true");
   } catch (e) {
-    notify(e.message);
+    if (requestId === previewRequestId) notify(e.message);
   }
+}
+function renderReaderMeta(data) {
+  const labels = [
+    data.summary ? "摘要" : "",
+    data.truncated ? "内容已截断" : "",
+  ].filter(Boolean);
+  const meta = $("#reader-meta");
+  meta.replaceChildren(el("span", "", labels.join(" · ")));
+  try {
+    const url = new URL(data.url);
+    if (!["http:", "https:"].includes(url.protocol)) return;
+    const link = el("a", "text-link", "查看原文");
+    link.href = url.href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    if (labels.length) meta.append(el("span", "", " · "));
+    meta.append(link);
+  } catch {}
 }
 async function busy(button, fn) {
   activeRequests++;
@@ -455,6 +491,7 @@ $("#feishu-form").onsubmit = (e) => {
         method: "PUT",
         body: JSON.stringify(feishuPayload()),
       });
+      if (selectedSource === "feishu") clearSource();
       $("#app-secret").value = "";
       r.textContent = "已保存，正在发现全部可访问文档";
       await loadState();
@@ -510,7 +547,10 @@ $("#pair-device").onclick = (e) =>
       notify(err.message);
     }
   });
-$("#close-articles").onclick = () => ($("#article-panel").hidden = true);
+$("#close-articles").onclick = () => {
+  sourceRequestId++;
+  $("#article-panel").hidden = true;
+};
 $("#font-smaller").onclick = () => {
   fontSize = Math.max(14, fontSize - 2);
   $("#reader").style.fontSize = fontSize + "px";
