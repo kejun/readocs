@@ -62,7 +62,7 @@ M5GFX `display(x,y,w,h)` 将指定范围与此前累计的脏区合并，再按�
 - `test_ui_power.py` 执行实际轻睡、主循环空闲分支和网络启动屏障，覆盖 1 秒/15 秒边界、纯定时检查、USB、按键/队列/AP/网络拒绝、失败回退及互斥。
 - 输入状态机和睡眠保护继续覆盖 25 ms 去抖、1 秒长按、组合键、波形期间积累输入和休眠前检查。按键采样独立于网络和绘制。
 
-烧录只写应用槽，保留设置、目录和正文。`status` 提供 `uptime_ms`、`light_sleeps`、`light_sleep_available` 和 `interaction_window_ms`；0.2.5 另提供 `font_family`、`fonts_ready`、`font_revision`、`emoji_sequences` 和 `font_size`。
+烧录只写应用槽，保留设置、目录和正文。`status` 提供 `uptime_ms`、`light_sleeps`、`light_sleep_available` 和 `interaction_window_ms`；0.2.5 另提供 `font_family`、`fonts_ready`、`font_revision`、`emoji_sequences` 和 `font_size`，0.2.6 增加 `font_weight`，当前为 500。
 
 在具有下一项的来源/菜单/同屏列表上，USB 发送一次 `{"cmd":"light_sleep_probe"}` 验证真实轻睡、8 KiB PSRAM 保留及随后一次选择移动仍为快速局刷。探针会自动移到下一项，且仅此显式诊断将结果写入 NVS；普通轻睡循环不写 Flash。ESP32-S3 的原生 USB 时钟在轻睡时停止，主机可能失联，需要重连或受控复位恢复，见[官方说明](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-guides/usb-serial-jtag-console.html)。恢复后从 `status.light_sleep_probe` 读取已保存的 `complete`、`ok`、`psram_retained`、`fast_refresh_retained` 和局刷前后计数，不能用在线串口是否一直响应判断轻睡成功。
 
@@ -101,3 +101,11 @@ M5GFX `display(x,y,w,h)` 将指定范围与此前累计的脏区合并，再按�
 连续注入两次来源移动，最终选择未变时无屏幕提交，三次移动合并一次局刷。临时阈值 3 的空闲质量清理及恢复阈值 20 后的快速翻页均通过。真实轻睡探针保持 8 KiB PSRAM 和旧帧基准，睡后选择移动计数由 0 增至 1；受控复位后读取的新结果耗时 18 ms，与探针前保留的 19 ms 结果不同，确认本轮执行已完成。两来源、499 条目录、6 篇缓存和绑定保留，字号恢复 24，串口记录器恢复。私有原始记录位于 `artifacts/fonts-2026-10-25/`。
 
 菜单「字号」提供中文、英数和 `😀 ❤️ 👍🏽 👩‍💻 🇨🇳` 样张。主机测试确认实际解码产生黑白像素及正确序列字形；本轮 USB 验证不替代字体粗细、物理残影、电池实体键和电流的目视或测量反馈。
+
+## 0.2.6 中文字重调整（2026-10-25）
+
+用户反馈 0.2.5 中文观感仍有问题，并选择“字形太细、模糊或不好看”。比较固定源的 Regular / Medium / Bold 在三档原生 1 位转换下的样张后，正文与界面基础字重改为 Noto Sans SC Medium 500；标题沿用额外一像素加粗，Emoji 资源逐字节不变。该调整不改变绘制代码、局刷范围、波形或电源等待策略。
+
+三档字号共 126 个中英数字样本，去除空白边缘后的实际 BFF 解码位图与源转换器位图逐像素一致。七个资源独立重建一致，共 2,160,757 字节。字体、分页、刷新、轻睡、输入及睡眠相关 10 项回归、Ruff、差异检查和 SDK 构建通过。完整镜像 3,769,696 字节，SHA-256 `7e13d136371d4fb28c6a256e64a61e73f174cdd7a8deb6a53d2b7da284ba6fad`，仍仅写 `0x20000` 应用槽，设备端摘要校验通过；应用槽余 424,608 字节。
+
+USB 实机回归通过：来源选择 633–1,000 ms、文章选择 930 ms、24 像素正文翻页 1,503–1,510 ms，均为 `fast`；连按不变跳过、合并刷新和临时阈值 3 的质量清理后恢复快速翻页通过。同一缓存快照在 16 / 24 / 32 像素分别为 24 / 41 / 61 页，每档重新排版后下一次翻页均为局刷，最后恢复 24 像素。绑定、两来源、499 条目录和 6 篇缓存保留，15 秒交互窗口状态保留。轻睡相关代码未改，相关软件回归通过，本轮未重跑 0.2.5 的真实轻睡探针。私有记录位于 `artifacts/font-weight-2026-10-25/`；Medium 的屏幕观感仍待用户目视反馈。

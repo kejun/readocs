@@ -1,7 +1,7 @@
 Readocs native bitmap font resources
 
 noto_sc_16.bff, noto_sc_24.bff and noto_sc_32.bff are converted subsets of
-Noto Sans SC Regular.
+Noto Sans SC Medium (weight 500).
 Original font copyright notice: © 2014-2021 Adobe (http://www.adobe.com/).
 Licensed under the SIL Open Font License 1.1; see NotoSans-OFL.txt.
 

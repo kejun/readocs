@@ -32,6 +32,7 @@ def prepare_font_test(tmp_path):
 
 def test_font_resources_match_manifest():
     manifest = json.loads((FONTS / "manifest.json").read_text())
+    assert manifest["family"] == "Noto Sans SC Medium" and manifest["weight"] == 500
     for name, info in manifest["files"].items():
         data = (FONTS / name).read_bytes()
         assert len(data) == info["bytes"]

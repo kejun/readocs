@@ -939,8 +939,9 @@ void init_network() {
 }
 static void status_console() {
   Json j(cJSON_CreateObject());
-  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.5");
+  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.6");
   cJSON_AddStringToObject(j.get(), "font_family", "Noto Sans SC");
+  cJSON_AddNumberToObject(j.get(), "font_weight", reader_font_weight);
   cJSON_AddBoolToObject(j.get(), "fonts_ready", reader_fonts_ready());
   cJSON_AddNumberToObject(j.get(), "font_revision", font_asset_revision);
   cJSON_AddNumberToObject(j.get(), "emoji_sequences", emoji_sequence_count);

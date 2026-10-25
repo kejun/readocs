@@ -1,5 +1,6 @@
 {
-  "family": "Noto Sans SC Regular",
+  "family": "Noto Sans SC Medium",
+  "weight": 500,
   "sizes_px": [
     16,
     24,
@@ -13,7 +14,7 @@
   "emoji_designs": 1732,
   "emoji_data_version": "17.0",
   "unsupported_fully_qualified": 155,
-  "revision": "be2988aacacef51441e02f6fcf5034b54a7e5dea4072fb50a95c42c616116292",
+  "revision": "1c8aa82164a89745de28a8303c6fa8a73b42e253ca94f45052293a1424ebfb88",
   "files": {
     "emoji.emap": {
       "bytes": 100513,
@@ -32,16 +33,16 @@
       "sha256": "ead1f36d9bc7a0f8f3c3e8b99705ae3a90f0862ce1c6543c8491b4cb7fec5c1a"
     },
     "noto_sc_16.bff": {
-      "bytes": 256808,
-      "sha256": "3a6e2c6d58dea87e429cd393c01fb268fd90f908554a6836013929bcfd79e88d"
+      "bytes": 265004,
+      "sha256": "de026a1ca34fdd4d049da71fda771db31f422f5abc4020619f1ba6981cc032e5"
     },
     "noto_sc_24.bff": {
-      "bytes": 501428,
-      "sha256": "642e35c2a242e4ff9fa584ca5f0984b94042c80191cb06da9bd48bb3327e6a67"
+      "bytes": 508744,
+      "sha256": "159941d09b28f2f8ae7a53c6815c62d2bce89eb586b25ff03ed5de589d4995d4"
     },
     "noto_sc_32.bff": {
-      "bytes": 838340,
-      "sha256": "42d13fafab79c7efbf0e3ad026eca80c90aca03d004b52e28df7c91b3ff550d9"
+      "bytes": 860580,
+      "sha256": "ed2c16e214dec23b8159e293adfb7a1e43f52c0484ad744f88a38fb3427700cb"
     }
   },
   "tools": {
@@ -51,9 +52,9 @@
   },
   "source_files": [
     {
-      "name": "NotoSansSC-Regular.otf",
-      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf",
-      "sha256": "faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9"
+      "name": "NotoSansSC-Medium.otf",
+      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/SubsetOTF/SC/NotoSansSC-Medium.otf",
+      "sha256": "7633f5a016d4dd95e685a69633d818aabc4644c4b08e26bd35b1b30c45ed5dda"
     },
     {
       "name": "NotoEmoji.ttf",

@@ -96,7 +96,7 @@ def main():
         mapped = Path(temp) / "emoji.ttf"
         ttf.save(mapped)
         for family, source, charset in (
-            ("noto_sc", args.source_dir / "NotoSansSC-Regular.otf", symbols),
+            ("noto_sc", args.source_dir / "NotoSansSC-Medium.otf", symbols),
             (
                 "noto_emoji",
                 mapped,
@@ -146,10 +146,12 @@ def main():
     (output / "revision.hpp").write_text(
         "#pragma once\n#include <cstdint>\nnamespace rd {\n"
         f"inline constexpr uint32_t font_asset_revision = 0x{int(revision[:8], 16) & 0x7FFFFFFF:08x};\n"
+        "inline constexpr unsigned reader_font_weight = 500;\n"
         f"inline constexpr unsigned emoji_sequence_count = {len(sequences)};\n}}\n"
     )
     manifest = {
-        "family": "Noto Sans SC Regular",
+        "family": "Noto Sans SC Medium",
+        "weight": 500,
         "sizes_px": [16, 24, 32],
         "bpp": 1,
         "chinese_charset_count": len(symbols),
