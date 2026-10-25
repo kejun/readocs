@@ -48,14 +48,22 @@ struct Entry {
            title == other.title && snapshot_id == other.snapshot_id;
   }
 };
+struct Source {
+  std::string id, title;
+  int count = 0;
+  bool operator==(const Source &other) const {
+    return id == other.id && title == other.title && count == other.count;
+  }
+};
 struct Model {
   std::mutex mutex;
   Config config;
   std::vector<Entry> entries;
+  std::vector<Source> sources;
   std::string current_source, current_document, displayed_snapshot;
   int page = 0;
-  View view = View::Articles;
-  int list_index = 0, page_count = 0;
+  View view = View::Sources;
+  int list_index = 0, source_index = 0, page_count = 0;
   unsigned render_count = 0;
   std::string selected_source, selected_document;
   std::string etag, status = "等待配置", ssid, ip, ap_ssid, ap_password,
@@ -105,7 +113,8 @@ bool save_directory_progress_file(const std::string &body);
 void clear_directory_progress();
 bool load_storage();
 bool save_config(const Config &cfg);
-bool commit_cache(const std::vector<Entry> &entries, const std::string &etag);
+bool commit_cache(const std::vector<Entry> &entries, const std::string &etag,
+                  const std::vector<Source> &sources);
 void save_position(const Position &pos);
 Position load_position(const std::string &document);
 void collect_cache(bool reclaim_previous = false);
@@ -119,7 +128,9 @@ std::vector<Page> layout(const std::string &snapshot, int size);
 void draw_page(const Entry &entry, const std::vector<Page> &pages, int index);
 void draw_menu(const std::vector<std::string> &options, int selected,
                const std::string &title);
-void draw_articles(const std::vector<Entry> &entries, int selected);
+void draw_sources(const std::vector<Source> &sources, int selected);
+void draw_articles(const std::vector<Entry> &entries, int selected,
+                   const std::string &source_title, int source_count);
 void draw_message(const std::string &title,
                   const std::vector<std::string> &lines, int size = 24);
 void draw_cover();

@@ -12,10 +12,11 @@
 
 namespace rd {
 inline constexpr size_t cache_read_chunk = 4096;
+inline constexpr size_t cache_write_chunk = 4096;
 inline void cache_read_yield() {
 #ifdef ESP_PLATFORM
   // A yield to another ready task does not let IDLE run. Block for one tick
-  // between filesystem reads so IDLE can service its watchdog subscription.
+  // between filesystem operations so IDLE can service its watchdog subscription.
   vTaskDelay(1);
 #endif
 }
@@ -55,9 +56,10 @@ inline std::string read_cache_file(const std::string &path, size_t limit) {
   return read_cache_file(path, limit, cache_read_yield);
 }
 
-template <typename Digest>
+template <typename Digest, typename Write, typename Yield>
 bool publish_cache_file(const std::string &path, const std::string &body,
-                        const std::string &digest, Digest hash) {
+                        const std::string &digest, Digest hash, Write write,
+                        Yield cooperate) {
   if (hash(body) != digest)
     return false;
   if (hash(read_cache_file(path, body.size())) == digest)
@@ -66,24 +68,71 @@ bool publish_cache_file(const std::string &path, const std::string &body,
   FILE *f = std::fopen(temp.c_str(), "wb");
   if (!f)
     return false;
-  bool ok = std::fwrite(body.data(), 1, body.size(), f) == body.size() &&
-            std::fflush(f) == 0;
-  if (ok)
-    ok = fsync(fileno(f)) == 0;
-  if (std::fclose(f) != 0)
+  // SPIFFS must reclaim enough pages for each underlying write before it
+  // starts. A large write can exceed its per-call GC budget despite ample
+  // deleted space. Disable stdio buffering so each request stays bounded.
+  errno = 0;
+  bool ok = std::setvbuf(f, nullptr, _IONBF, 0) == 0;
+  int failure_errno = ok ? 0 : (errno ? errno : EIO);
+  size_t written = 0;
+  while (ok && written < body.size()) {
+    cooperate();
+    const size_t count = std::min(cache_write_chunk, body.size() - written);
+    errno = 0;
+    if (write(body.data() + written, count, f) != count) {
+      failure_errno = errno ? errno : EIO;
+      ok = false;
+      break;
+    }
+    written += count;
+  }
+  if (ok && std::fflush(f) != 0) {
+    failure_errno = errno ? errno : EIO;
     ok = false;
-  if (ok)
+  }
+  if (ok && fsync(fileno(f)) != 0) {
+    failure_errno = errno ? errno : EIO;
+    ok = false;
+  }
+  if (std::fclose(f) != 0) {
+    if (ok)
+      failure_errno = errno ? errno : EIO;
+    ok = false;
+  }
+  if (ok) {
+    errno = 0;
     ok = hash(read_cache_file(temp, body.size())) == digest;
+    if (!ok)
+      failure_errno = errno ? errno : EIO;
+  }
   // SPIFFS cannot rename over an existing object. Only a verified-bad target
   // may be removed, and only after its replacement is durable and verified.
   // An interruption leaves a valid old object or a recoverable missing object.
   if (ok && hash(read_cache_file(path, body.size())) != digest &&
-      std::remove(path.c_str()) != 0 && errno != ENOENT)
+      std::remove(path.c_str()) != 0 && errno != ENOENT) {
+    failure_errno = errno;
     ok = false;
-  if (ok)
+  }
+  if (ok) {
     ok = std::rename(temp.c_str(), path.c_str()) == 0;
-  if (!ok)
+    if (!ok)
+      failure_errno = errno;
+  }
+  if (!ok) {
     std::remove(temp.c_str());
+    errno = failure_errno;
+  }
   return ok;
+}
+
+template <typename Digest>
+bool publish_cache_file(const std::string &path, const std::string &body,
+                        const std::string &digest, Digest hash) {
+  return publish_cache_file(
+      path, body, digest, hash,
+      [](const char *data, size_t count, FILE *file) {
+        return std::fwrite(data, 1, count, file);
+      },
+      cache_read_yield);
 }
 } // namespace rd

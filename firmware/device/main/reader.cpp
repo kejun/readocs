@@ -1,4 +1,5 @@
 #include "readocs.hpp"
+#include "layout_width.hpp"
 #include <algorithm>
 #include <cctype>
 #include <esp_log.h>
@@ -30,6 +31,9 @@ static bool articles_valid = false;
 static std::string articles_signature;
 static int articles_selected = -1;
 static int articles_start = -1;
+static bool sources_valid = false;
+static std::string sources_signature;
+static int sources_selected = -1, sources_start = -1;
 static bool page_valid = false;
 static std::string page_document, page_snapshot;
 static unsigned page_font_size = 0;
@@ -38,6 +42,7 @@ static int page_index = -1, page_count = 0;
 static void invalidate_navigation() {
   menu_valid = false;
   articles_valid = false;
+  sources_valid = false;
   page_valid = false;
 }
 
@@ -120,9 +125,14 @@ static bool extends(uint32_t cp) {
          (cp >= 0xe0100 && cp <= 0xe01ef);
 }
 std::vector<Page> layout(const std::string &snapshot, int size) {
+  const int64_t started = esp_timer_get_time();
   Json doc(cJSON_Parse(read_file(snapshot).c_str()));
-  if (!doc)
+  if (!doc) {
+    ESP_LOGW("readocs", "layout invalid snapshot=%s", snapshot.c_str());
     return {};
+  }
+  ESP_LOGI("readocs", "layout start snapshot=%s size=%d", snapshot.c_str(), size);
+  GlyphExtentCache glyphs[2];
   std::vector<Page> pages(1);
   int y = 94;
   const int bottom = 887, line_height = size + 14;
@@ -160,6 +170,28 @@ std::vector<Page> layout(const std::string &snapshot, int size) {
     else if (type == "quote")
       line = "│ ";
     font(size, heading);
+    const auto *active_font = M5.Display.getFont();
+    const int scale = 65536 * (size == 32 ? 32.0f / 24.0f : 1.0f);
+    auto measure = [&](uint32_t cp) {
+      lgfx::FontMetrics metrics{};
+      active_font->getDefaultMetric(&metrics);
+      if (cp > 0xffff ||
+          (!active_font->updateFontMetric(&metrics, cp) && cp != 0))
+        active_font->updateFontMetric(&metrics, 0);
+      return GlyphExtent{(metrics.x_advance * scale) >> 16,
+                         (metrics.width * scale) >> 16,
+                         (metrics.x_offset * scale) >> 16};
+    };
+    auto append_width = [&](LineExtent &width, const std::string &part) {
+      for (size_t at = 0; at < part.size();) {
+        const auto cp = codepoint(part, at);
+        if (cp < 0x20 || (cp >= 0xfe00 && cp < 0xfe10))
+          continue;
+        width.append(glyphs[heading].get(cp, measure));
+      }
+    };
+    LineExtent line_width;
+    append_width(line_width, line);
     for (size_t i = 0; i < text.size();) {
       // Long documents must let the idle task run during font measurement.
       if ((offset & 63) == 0)
@@ -183,17 +215,22 @@ std::vector<Page> layout(const std::string &snapshot, int size) {
       if (cp == '\n') {
         add(std::string(indent / 8, ' ') + line, heading, bid, line_start);
         line.clear();
+        line_width = {};
         offset += cluster_count;
         line_start = offset;
         continue;
       }
       auto cluster = text.substr(start, i - start);
-      if (!line.empty() &&
-          M5.Display.textWidth((line + cluster).c_str()) > 476 - indent) {
+      auto next_width = line_width;
+      append_width(next_width, cluster);
+      if (!line.empty() && next_width.width() > 476 - indent) {
         add(std::string(indent / 8, ' ') + line, heading, bid, line_start);
         line.clear();
         line_start = offset;
+        next_width = {};
+        append_width(next_width, cluster);
       }
+      line_width = next_width;
       line += cluster;
       offset += cluster_count;
     }
@@ -203,6 +240,9 @@ std::vector<Page> layout(const std::string &snapshot, int size) {
   }
   if (pages.size() == 1 && pages[0].lines.empty())
     add("[此文档没有可显示的正文]", false, "", 0);
+  ESP_LOGI("readocs", "layout done pages=%u time_ms=%d",
+           static_cast<unsigned>(pages.size()),
+           static_cast<int>((esp_timer_get_time() - started) / 1000));
   return pages;
 }
 static void begin() {
@@ -423,9 +463,93 @@ static void draw_menu_row(const std::vector<std::string> &options, int selected,
   d.setTextColor(TFT_BLACK, TFT_WHITE);
 }
 
-void draw_articles(const std::vector<Entry> &entries, int selected) {
+static std::string fit_header(std::string title) {
+  if (M5.Display.textWidth(title.c_str()) <= 330)
+    return title;
+  while (!title.empty() && M5.Display.textWidth((title + "…").c_str()) > 330) {
+    size_t end = title.size() - 1;
+    while (end > 0 && (static_cast<unsigned char>(title[end]) & 0xc0) == 0x80)
+      --end;
+    title.resize(end);
+  }
+  return title + "…";
+}
+
+static void draw_source_row(const std::vector<Source> &sources, int selected,
+                             int index, int y) {
   auto &d = M5.Display;
-  const std::string signature = article_signature_of(entries);
+  const bool active = index == selected;
+  d.fillRect(24, y - 8, 492, 80, active ? TFT_BLACK : TFT_WHITE);
+  d.setTextColor(active ? TFT_WHITE : TFT_BLACK,
+                 active ? TFT_BLACK : TFT_WHITE);
+  font(24);
+  const auto lines = article_title(sources[index].title);
+  for (size_t n = 0; n < lines.size(); ++n) {
+    d.setCursor(40, y + n * 30);
+    d.print(lines[n].c_str());
+  }
+  font(16);
+  const auto count = std::to_string(sources[index].count) + " 篇";
+  d.setCursor(496 - d.textWidth(count.c_str()), y + 58);
+  d.print(count.c_str());
+  d.setTextColor(TFT_BLACK, TFT_WHITE);
+}
+
+void draw_sources(const std::vector<Source> &sources, int selected) {
+  auto &d = M5.Display;
+  std::string signature;
+  for (const auto &source : sources)
+    signature += source.id + '\x1f' + source.title + '\x1f' +
+                 std::to_string(source.count) + '\n';
+  selected = sources.empty() ? 0
+                             : std::clamp(selected, 0, static_cast<int>(sources.size()) - 1);
+  const int start = selected / article_page_size * article_page_size;
+  if (sources_valid && signature == sources_signature && start == sources_start) {
+    if (selected == sources_selected)
+      return;
+    const int old_y = 120 + (sources_selected - start) * 88;
+    const int new_y = 120 + (selected - start) * 88;
+    const int top = std::min(old_y, new_y) - 8;
+    const int bottom = std::max(old_y, new_y) + 72;
+    d.setEpdMode(kPartialMode);
+    d.setClipRect(24, top, 492, bottom - top);
+    draw_source_row(sources, selected, sources_selected, old_y);
+    draw_source_row(sources, selected, selected, new_y);
+    d.clearClipRect();
+    finish_partial();
+    sources_selected = selected;
+    return;
+  }
+  begin();
+  font(24, true);
+  d.setCursor(32, 36);
+  d.print("内容来源");
+  d.drawFastHLine(32, 86, 476, TFT_BLACK);
+  if (sources.empty()) {
+    font(24);
+    d.setCursor(32, 160);
+    d.print("暂无内容来源");
+  } else
+    for (int i = start;
+         i < std::min(start + article_page_size, static_cast<int>(sources.size())); ++i)
+      draw_source_row(sources, selected, i, 120 + (i - start) * 88);
+  font(16);
+  d.setCursor(32, 880);
+  d.print("A 下一来源    A+B 上一来源    B 进入");
+  d.setCursor(32, 922);
+  d.print("按住 A 检查更新    按住 B 菜单");
+  finish();
+  sources_valid = true;
+  sources_signature = signature;
+  sources_selected = selected;
+  sources_start = start;
+}
+
+void draw_articles(const std::vector<Entry> &entries, int selected,
+                   const std::string &source_title, int source_count) {
+  auto &d = M5.Display;
+  const std::string signature = source_title + '\n' + std::to_string(source_count) +
+                                '\n' + article_signature_of(entries);
   if (!entries.empty())
     selected = std::clamp(selected, 0, static_cast<int>(entries.size()) - 1);
   const int start =
@@ -450,12 +574,12 @@ void draw_articles(const std::vector<Entry> &entries, int selected) {
   begin();
   font(24, true);
   d.setCursor(32, 36);
-  d.print("文章列表");
+  d.print(fit_header(source_title).c_str());
   d.drawFastHLine(32, 86, 476, TFT_BLACK);
   if (entries.empty()) {
     font(24);
     d.setCursor(32, 160);
-    d.print("暂无文章");
+    d.print(source_count > 0 ? "目录同步中" : "暂无文章");
   } else {
     const int end =
         std::min(start + article_page_size, static_cast<int>(entries.size()));
@@ -473,10 +597,10 @@ void draw_articles(const std::vector<Entry> &entries, int selected) {
     d.setCursor(32, 880);
     d.print("A 下一项    A+B 上一项    B 打开");
     d.setCursor(32, 922);
-    d.print("按住 A 翻页    按住 B 菜单");
+    d.print("按住 A 翻页    按住 B 返回来源");
   } else {
     d.setCursor(32, 922);
-    d.print("按住 B 菜单");
+    d.print("按住 B 返回来源");
   }
   finish();
   articles_valid = true;

@@ -1,6 +1,7 @@
 #include "cache_merge.hpp"
 #include "cache_policy.hpp"
 #include "readocs.hpp"
+#include "source_metadata.hpp"
 #include <algorithm>
 #include <cstring>
 #include <ctime>
@@ -11,6 +12,7 @@
 #include <esp_heap_caps.h>
 #include <esp_http_client.h>
 #include <esp_http_server.h>
+#include <esp_log.h>
 #include <esp_mac.h>
 #include <esp_netif.h>
 #include <esp_netif_sntp.h>
@@ -206,10 +208,20 @@ static esp_err_t http_event(esp_http_client_event_t *e) {
   }
   return ESP_OK;
 }
+static void log_http_result(int status, esp_err_t err, size_t bytes,
+                            int64_t started) {
+  ESP_LOGI("readocs-net",
+           "http status=%d err=%s bytes=%u elapsed_ms=%lld remaining_ms=%lld",
+           status, esp_err_to_name(err), static_cast<unsigned>(bytes),
+           static_cast<long long>(now_ms() - started),
+           static_cast<long long>(deadline - now_ms()));
+}
 static int request(const Config &c, const std::string &path, Http &out,
                    const std::string &body = "", const std::string &etag = "") {
+  const auto started = now_ms();
   if (now_ms() >= deadline) {
     error_text = "联网超时，已保留离线内容";
+    log_http_result(-1, ESP_ERR_TIMEOUT, 0, started);
     return -1;
   }
   const std::string url = c.server + path;
@@ -230,8 +242,11 @@ static int request(const Config &c, const std::string &path, Http &out,
       h.cert_pem = http_ca.c_str();
     http_client = esp_http_client_init(&h);
   }
-  if (!http_client)
+  if (!http_client) {
+    error_text = "代理连接初始化失败，旧内容已保留";
+    log_http_result(-1, ESP_ERR_NO_MEM, 0, started);
     return -1;
+  }
   auto client = http_client;
   auto header = [client](const char *key, const char *value) {
     auto err = esp_http_client_set_header(client, key, value);
@@ -259,12 +274,14 @@ static int request(const Config &c, const std::string &path, Http &out,
   if (!configured) {
     close_http();
     error_text = "代理请求初始化失败，旧内容已保留";
+    log_http_result(-1, ESP_FAIL, 0, started);
     return -1;
   }
   auto err = esp_http_client_perform(client);
   int status = err == ESP_OK && !out.overflow
                    ? esp_http_client_get_status_code(client)
                    : -1;
+  log_http_result(status, err, out.body.size(), started);
   // Event callbacks must never retain the address of this stack response.
   esp_http_client_set_user_data(client, nullptr);
   esp_http_client_set_post_field(client, nullptr, 0);
@@ -282,7 +299,8 @@ static int request(const Config &c, const std::string &path, Http &out,
   else if (status == 429)
     error_text = "检查过于频繁，请稍后重试";
   else if (status < 0)
-    error_text = "Wi-Fi 已连接，代理未连接";
+    error_text = out.overflow ? "代理响应超过设备限制，旧内容已保留"
+                             : "Wi-Fi 已连接，代理未连接";
   else if (status >= 400) {
     Json j(cJSON_Parse(out.body.c_str()));
     error_text = str(j.get(), "message");
@@ -291,51 +309,67 @@ static int request(const Config &c, const std::string &path, Http &out,
   }
   return status;
 }
+static bool body_failure(const char *stage, const char *message, int chunk = -1,
+                         bool preserve_error = false) {
+  if (!preserve_error || error_text.empty())
+    error_text = message;
+  ESP_LOGW("readocs-net", "body stage=%s chunk=%d", stage, chunk);
+  return false;
+}
 static bool download(const Config &c, cJSON *ref, std::string &id) {
   if (!cJSON_IsObject(ref))
-    return false;
+    return body_failure("reference", "正文引用格式无效，旧内容已保留");
   id = str(ref, "snapshot_id");
   auto bytes = num(ref, "bytes");
   if (!valid_hash(id) || bytes < 1 || bytes > 300 * 1024 ||
       str(ref, "sha256") != id)
-    return false;
+    return body_failure("reference", "正文引用超出限制或校验无效，旧内容已保留");
   if (sha256(read_file(id)) == id)
     return true;
   auto *chunks = cJSON_GetObjectItemCaseSensitive(ref, "chunks");
   int count = cJSON_GetArraySize(chunks);
-  if (!count || count > 10)
-    return false;
+  if (!cJSON_IsArray(chunks) || !count || count > 10 ||
+      count != (bytes + 32767) / 32768)
+    return body_failure("chunk_list", "正文分块清单不完整，旧内容已保留");
   std::string body;
   body.reserve(bytes);
   for (int i = 0; i < count; ++i) {
     auto *ch = cJSON_GetArrayItem(chunks, i);
     Http out{{}, {}, 32768};
-    if (num(ch, "index", -1) != i ||
-        request(c, "/v1/snapshots/" + id + "/chunks/" + std::to_string(i),
-                out) != 200 ||
-        static_cast<int>(out.body.size()) != num(ch, "bytes") ||
-        sha256(out.body) != str(ch, "sha256"))
-      return false;
+    if (!cJSON_IsObject(ch) || num(ch, "index", -1) != i ||
+        num(ch, "bytes") != std::min(32768, bytes - i * 32768) ||
+        !valid_hash(str(ch, "sha256")))
+      return body_failure("chunk_metadata", "正文分块引用无效，旧内容已保留", i);
+    if (request(c, "/v1/snapshots/" + id + "/chunks/" + std::to_string(i),
+                out) != 200)
+      return body_failure("chunk_request", "正文分块下载失败，旧内容已保留", i,
+                          true);
+    if (static_cast<int>(out.body.size()) != num(ch, "bytes"))
+      return body_failure("chunk_size", "正文分块长度不符，旧内容已保留", i);
+    if (sha256(out.body) != str(ch, "sha256"))
+      return body_failure("chunk_hash", "正文分块校验失败，旧内容已保留", i);
     body += out.body;
   }
   if (static_cast<int>(body.size()) != bytes || sha256(body) != id)
-    return false;
+    return body_failure("body_hash", "正文整体校验失败，旧内容已保留");
   Json root(cJSON_Parse(body.c_str()));
   if (!root || num(root.get(), "schema_version") != 1)
-    return false;
+    return body_failure("schema", "正文格式不兼容，请更新固件");
   auto *blocks = cJSON_GetObjectItemCaseSensitive(root.get(), "blocks");
   if (!cJSON_IsArray(blocks) || cJSON_GetArraySize(blocks) > 500)
-    return false;
+    return body_failure("structure", "正文结构超出限制，旧内容已保留");
   std::vector<std::string> ids;
   cJSON *b;
   cJSON_ArrayForEach(b, blocks) {
     auto bid = str(b, "block_id");
     if (bid.empty() || std::find(ids.begin(), ids.end(), bid) != ids.end() ||
         str(b, "text").size() > 65536)
-      return false;
+      return body_failure("structure", "正文段落结构无效，旧内容已保留");
     ids.push_back(bid);
   }
-  return write_file(id, body);
+  if (!write_file(id, body))
+    return body_failure("body_write", "正文缓存写入失败，旧内容已保留");
+  return true;
 }
 static constexpr size_t directory_limit = 512 * 1024;
 static bool safe_id(const std::string &id) {
@@ -402,18 +436,21 @@ static void compact_directory_progress(const std::string &source,
 }
 static bool fetch_entry(const Config &c, Entry &entry) {
   Http response{{}, {}, 4096};
-  if (!safe_id(entry.source_id) || !safe_id(entry.document_id) ||
-      request(c,
-              "/v1/sources/" + entry.source_id + "/documents/" +
+  if (!safe_id(entry.source_id) || !safe_id(entry.document_id))
+    return body_failure("identity", "文档标识无效，旧内容已保留");
+  if (request(c, "/v1/sources/" + entry.source_id + "/documents/" +
                   entry.document_id,
               response) != 200)
-    return false;
+    return body_failure("reference_request", "正文引用获取失败，旧内容已保留", -1,
+                        true);
   Json item(cJSON_Parse(response.body.c_str()));
   if (!item || str(item.get(), "document_id") != entry.document_id)
-    return false;
+    return body_failure("reference_json", "正文引用返回无效，旧内容已保留");
   auto *ref = cJSON_GetObjectItemCaseSensitive(item.get(), "snapshot");
-  if (!cJSON_IsObject(ref))
+  if (cJSON_IsNull(ref))
     return true; // Discovery precedes the independent upstream body job.
+  if (!cJSON_IsObject(ref))
+    return body_failure("reference_json", "正文引用返回无效，旧内容已保留");
   std::string id;
   if (!download(c, ref, id))
     return false;
@@ -430,16 +467,18 @@ static bool sync(bool manual) {
     return false;
   std::string etag;
   std::vector<Entry> old;
+  std::vector<Source> old_sources;
   {
     std::lock_guard<std::mutex> g(model.mutex);
     etag = model.etag;
     old = model.entries;
+    old_sources = model.sources;
   }
   const auto selected = current_article();
   if (!compact_cache_for_download(
           old, selected.first, selected.second,
           [&](const std::vector<Entry> &compact) {
-            if (!commit_cache(compact, etag))
+            if (!commit_cache(compact, etag, old_sources))
               return false;
             std::lock_guard<std::mutex> g(model.mutex);
             model.entries = compact;
@@ -466,8 +505,30 @@ static bool sync(bool manual) {
     std::vector<std::string> unchanged_snapshots;
     bool complete = true;
     auto *sources = cJSON_GetObjectItemCaseSensitive(manifest.get(), "sources");
-    if (!cJSON_IsArray(sources))
+    std::vector<Source> declared_sources;
+    if (!read_source_metadata(sources, declared_sources)) {
+      error_text = "来源清单无效，旧内容已保留";
       return false;
+    }
+    // Publish names/counts before walking any directory pages. Keep the old
+    // ETag until the complete directory and body prefetch have been committed,
+    // otherwise a 304 could strand an unfinished scan after a restart.
+    auto retained = old;
+    retain_source_entries(retained, declared_sources);
+    if (declared_sources != old_sources || retained != old) {
+      if (!commit_cache(retained, etag, declared_sources)) {
+        error_text = "来源清单保存失败，旧内容已保留";
+        return false;
+      }
+      {
+        std::lock_guard<std::mutex> g(model.mutex);
+        model.entries = retained;
+        model.sources = declared_sources;
+        model.sync_pending = true;
+      }
+      old = std::move(retained);
+      redraw = true;
+    }
     Json directory(cJSON_Duplicate(sources, true));
     if (!directory)
       return false;
@@ -495,9 +556,12 @@ static bool sync(bool manual) {
       }
     }
     size_t expected = 0;
-    cJSON *source_count;
-    cJSON_ArrayForEach(source_count, sources) expected +=
-        std::max(0, num(source_count, "count"));
+    for (const auto &source : declared_sources) {
+      if (static_cast<size_t>(source.count) >
+          std::numeric_limits<size_t>::max() - expected)
+        return false;
+      expected += source.count;
+    }
     if (source_index < 0 || source_index > cJSON_GetArraySize(sources) ||
         cursor < 0 || entries.size() > expected ||
         (source_index == cJSON_GetArraySize(sources) &&
@@ -590,13 +654,14 @@ static bool sync(bool manual) {
         complete = false;
     }
     const auto saved_etag = complete ? out.etag : etag;
-    if (!commit_cache(entries, saved_etag)) {
+    if (!commit_cache(entries, saved_etag, declared_sources)) {
       error_text = "缓存保存失败，旧版本已保留";
       return false;
     }
     {
       std::lock_guard<std::mutex> g(model.mutex);
       model.entries = entries;
+      model.sources = declared_sources;
       model.etag = saved_etag;
     }
     if (complete)
@@ -624,7 +689,7 @@ static bool sync(bool manual) {
     prepare_download_space();
     if (selected != entries.end() && !fetch_entry(c, *selected))
       return false;
-    if (!commit_cache(entries, etag)) {
+    if (!commit_cache(entries, etag, old_sources)) {
       error_text = "缓存保存失败，旧版本已保留";
       return false;
     }
@@ -667,10 +732,12 @@ static bool download_article(const cJSON *input) {
   if (!safe_id(source) || !safe_id(doc))
     return false;
   std::vector<Entry> entries;
+  std::vector<Source> sources;
   std::string etag;
   {
     std::lock_guard<std::mutex> g(model.mutex);
     entries = model.entries;
+    sources = model.sources;
     etag = model.etag;
   }
   auto selected =
@@ -680,16 +747,16 @@ static bool download_article(const cJSON *input) {
   if (selected == entries.end())
     return false;
   prepare_download_space();
-  if (!fetch_entry(c, *selected) || selected->snapshot_id.empty()) {
-    error_text = "正文尚未同步，请稍后重试";
+  if (!fetch_entry(c, *selected))
     return false;
-  }
+  if (selected->snapshot_id.empty())
+    return body_failure("not_ready", "正文尚未同步，请稍后重试");
   // Selection can change while the queued download is running. Keep both the
   // displayed selection and its just-completed request until the next sync.
   const auto current = current_article();
   trim_cached_articles(entries, current.first, current.second, source, doc);
-  if (!commit_cache(entries, etag))
-    return false;
+  if (!commit_cache(entries, etag, sources))
+    return body_failure("cache_commit", "目录缓存保存失败，旧内容已保留");
   {
     std::lock_guard<std::mutex> g(model.mutex);
     model.entries = entries;
@@ -870,7 +937,7 @@ void init_network() {
 }
 static void status_console() {
   Json j(cJSON_CreateObject());
-  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.2");
+  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.3");
   cJSON_AddBoolToObject(j.get(), "connected", connected.load());
   cJSON_AddBoolToObject(j.get(), "busy", networking.load());
   {
@@ -880,6 +947,27 @@ static void status_console() {
     cJSON_AddStringToObject(j.get(), "ssid", model.ssid.c_str());
     cJSON_AddBoolToObject(j.get(), "paired", !model.config.token.empty());
     cJSON_AddNumberToObject(j.get(), "documents", model.entries.size());
+    cJSON_AddNumberToObject(j.get(), "source_count", model.sources.size());
+    cJSON_AddNumberToObject(j.get(), "source_index", model.source_index);
+    auto *sources = cJSON_AddArrayToObject(j.get(), "sources");
+    for (const auto &source : model.sources) {
+      auto *item = cJSON_CreateObject();
+      cJSON_AddStringToObject(item, "id", source.id.c_str());
+      cJSON_AddStringToObject(item, "title", source.title.c_str());
+      cJSON_AddNumberToObject(item, "count", source.count);
+      cJSON_AddNumberToObject(
+          item, "local_documents",
+          std::count_if(model.entries.begin(), model.entries.end(),
+                        [&](const Entry &e) { return e.source_id == source.id; }));
+      cJSON_AddNumberToObject(
+          item, "cached_documents",
+          std::count_if(model.entries.begin(), model.entries.end(),
+                        [&](const Entry &e) {
+                          return e.source_id == source.id &&
+                                 !e.snapshot_id.empty();
+                        }));
+      cJSON_AddItemToArray(sources, item);
+    }
     cJSON_AddNumberToObject(
         j.get(), "cached_documents",
         std::count_if(model.entries.begin(), model.entries.end(),
@@ -1004,7 +1092,7 @@ void network_task(void *) {
     }
     std::unique_ptr<Action> action(ptr);
     networking = true;
-    deadline = now_ms() + 20000;
+    deadline = now_ms() + (action->type == "download" ? 60000 : 20000);
     http_retry_used = false;
     error_text.clear();
     bool ok = true;

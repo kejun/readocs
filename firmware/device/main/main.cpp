@@ -21,12 +21,14 @@ std::atomic<int64_t> last_input{0}, ap_activity{0};
 QueueHandle_t actions, buttons;
 static RTC_DATA_ATTR int retained_page = 0;
 static RTC_DATA_ATTR char retained_document[129]{};
-static RTC_DATA_ATTR int retained_view = static_cast<int>(View::Articles);
+static RTC_DATA_ATTR int retained_view = static_cast<int>(View::Sources);
 static RTC_DATA_ATTR int retained_selected = 0;
 static RTC_DATA_ATTR char retained_list_source[129]{};
 static RTC_DATA_ATTR char retained_list_document[129]{};
 static RTC_DATA_ATTR int64_t next_sync_at = 0;
 static RTC_DATA_ATTR unsigned failure_count = 0;
+static RTC_DATA_ATTR char retained_current_source[129]{};
+static RTC_DATA_ATTR SourceSelection retained_source_selections[retained_source_count]{};
 static bool sleeping = false;
 
 static bool keys_released() {
@@ -168,23 +170,49 @@ extern "C" void app_main() {
   }
   if (storage_ok)
     esp_ota_mark_app_valid_cancel_rollback();
-  View view = View::Articles;
+  View view = View::Sources;
   if (!cold && retained_view >= static_cast<int>(View::Reading) &&
-      retained_view <= static_cast<int>(View::Fonts))
+      retained_view <= static_cast<int>(View::Sources))
     view = static_cast<View>(retained_view);
   // A confirmation screen is never restored by a timer or wake-up key.
   if (view == View::Pair)
-    view = View::Articles;
-  ArticleCursor article_cursor;
-  bool list_touched = !cold;
-  std::vector<Entry> entries = model.entries;
+    view = View::Sources;
+  SourceBrowser browser;
+  std::vector<Entry> all_entries;
+  std::vector<Source> sources;
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    all_entries = model.entries;
+    sources = model.sources;
+  }
+  if (!cold)
+    browser.restore(retained_source_selections, retained_source_count, all_entries);
+  browser.reconcile(sources);
+  const bool restored_source = cold || browser.focus(sources, retained_list_source);
+  if (!restored_source && view == View::Articles)
+    view = View::Sources;
+  std::vector<Entry> entries = articles_for_source(all_entries, browser.source());
+  auto refresh_source_articles = [&] {
+    entries = articles_for_source(all_entries, browser.source());
+    browser.cursor().reconcile(entries);
+  };
+  bool deferred_pair_confirm = false;
+  auto discard_invalid_source_backlog = [&] {
+    Key queued;
+    while (xQueueReceive(buttons, &queued, 0) == pdTRUE) {
+      last_input = now_ms();
+      if (queued == Key::PairConfirm)
+        deferred_pair_confirm = true;
+      browser.source_input_activity();
+    }
+  };
   Entry current;
   std::vector<Page> pages;
   const int selected_max = view == View::Fonts ? 2 : view == View::Menu ? 6 : 5;
   int page = 0, selected = !cold ? std::clamp(retained_selected, 0, selected_max)
                                  : 0;
   auto open_entry = [&](const Entry &e, bool reflow = false) {
-    if (current.document_id != e.document_id)
+    if (current.source_id != e.source_id || current.document_id != e.document_id)
       position = load_position(e.document_id);
     current = e;
     {
@@ -222,26 +250,41 @@ extern "C" void app_main() {
         page = position.page;
     }
     if (std::string(retained_document) == e.document_id &&
+        std::string(retained_current_source) == e.source_id &&
         wake != ESP_SLEEP_WAKEUP_UNDEFINED &&
         position.snapshot == e.snapshot_id && !reflow)
       page = retained_page;
     page = std::clamp(page, 0, std::max(0, static_cast<int>(pages.size()) - 1));
   };
-  if (!entries.empty()) {
-    auto it = std::find_if(entries.begin(), entries.end(), [&](const Entry &e) {
-      return e.document_id == position.document;
+  if (!all_entries.empty()) {
+    auto it = std::find_if(all_entries.begin(), all_entries.end(), [&](const Entry &e) {
+      return e.document_id == position.document &&
+             (cold || !retained_current_source[0] ||
+              e.source_id == retained_current_source);
     });
-    current = it == entries.end() ? entries.front() : *it;
-    if (view == View::Reading)
-      open_entry(current);
+    if (it != all_entries.end()) {
+      current = *it;
+      if (cold || view == View::Reading)
+        browser.focus(sources, current.source_id);
+      refresh_source_articles();
+      if ((cold || view == View::Reading) && browser.source() == current.source_id)
+        browser.cursor().focus(entries, current.source_id, current.document_id);
+      if (view == View::Reading)
+        open_entry(current);
+    }
   }
-  article_cursor.focus(entries, !cold ? retained_list_source : "",
-                       !cold ? retained_list_document : "");
-  bool need_draw = cold || display_pending();
+  if (!cold && browser.cursor().document().empty())
+    browser.cursor().focus(entries, browser.source(), retained_list_document);
+  else
+    browser.cursor().reconcile(entries);
+  if (view == View::Reading && current.document_id.empty())
+    view = View::Sources;
+  bool need_draw = cold || !restored_source || display_pending();
   std::string last_status;
   bool previous_busy = false, ap_was = false;
   int64_t last_check = 0;
   while (true) {
+    const bool changed = redraw.exchange(false);
     if (power_off_requested.exchange(false)) {
       ESP_LOGI("readocs", "PM1 power key double-click");
       power_off_now();
@@ -250,18 +293,15 @@ extern "C" void app_main() {
       need_draw = true;
     std::string status, ssid, ap_ssid, ap_password;
     bool ap, sync_pending;
+    bool catalog_changed = false, selected_source_preserved = true;
     Config config;
     {
       std::lock_guard<std::mutex> g(model.mutex);
-      if ((redraw || entries.empty() || previous_busy != networking) &&
-          entries != model.entries) {
-        entries = model.entries;
-        if (view == View::Articles && !list_touched)
-          article_cursor.focus(entries, "", "");
-        else
-          article_cursor.reconcile(entries);
-        if (view == View::Articles)
-          need_draw = true;
+      if ((changed || all_entries.empty() || previous_busy != networking) &&
+          (all_entries != model.entries || sources != model.sources)) {
+        all_entries = model.entries;
+        sources = model.sources;
+        catalog_changed = true;
       }
       status = model.status;
       ssid = model.ssid;
@@ -270,6 +310,30 @@ extern "C" void app_main() {
       ap_ssid = model.ap_ssid;
       ap_password = model.ap_password;
       config = model.config;
+    }
+    if (catalog_changed) {
+      selected_source_preserved = browser.reconcile(sources);
+      refresh_source_articles();
+      // Losing a source returns to source selection; a queued B cannot open
+      // an article from whichever source moved into the old list position.
+      if (!selected_source_preserved && view == View::Articles)
+        view = View::Sources;
+      if (view == View::Articles || view == View::Sources)
+        need_draw = true;
+      // A completed on-demand download can be followed immediately by sync.
+      // Open its committed snapshot without waiting for a sampled idle edge.
+      if (view == View::Reading && pages.empty() &&
+          !current.document_id.empty()) {
+        auto updated =
+            std::find_if(all_entries.begin(), all_entries.end(), [&](const Entry &e) {
+              return e.source_id == current.source_id &&
+                     e.document_id == current.document_id;
+            });
+        if (updated != all_entries.end() && !updated->snapshot_id.empty()) {
+          open_entry(*updated);
+          need_draw = true;
+        }
+      }
     }
     if (ap != ap_was) {
       need_draw = true;
@@ -290,33 +354,24 @@ extern "C" void app_main() {
                        std::min<unsigned>(
                            21600, config.interval *
                                       (1U << std::min(failure_count - 1, 5U)));
-      if (view == View::Reading && pages.empty() &&
-          !current.document_id.empty()) {
-        auto updated =
-            std::find_if(entries.begin(), entries.end(), [&](const Entry &e) {
-              return e.document_id == current.document_id;
-            });
-        if (updated != entries.end() && !updated->snapshot_id.empty()) {
-          open_entry(*updated);
-          need_draw = true;
-        }
-      }
-      if (view == View::Reading && current.document_id.empty() &&
-          !entries.empty()) {
-        open_entry(entries.front());
-        need_draw = true;
-      }
     }
     previous_busy = networking;
     Key event;
     bool handled = false;
     while (xQueueReceive(buttons, &event, 0) == pdTRUE) {
       handled = true;
-      list_touched = true;
       const int64_t lag = now_ms() - last_input;
       if (lag > 250)
         ESP_LOGI("readocs", "key lag=%lld ms", static_cast<long long>(lag));
       last_input = now_ms();
+      if (view == View::Sources && browser.source_input_fenced()) {
+        // A source disappeared while old navigation was in flight. Discard
+        // that navigation until its waveform and physical gesture have ended.
+        if (event == Key::PairConfirm)
+          deferred_pair_confirm = true;
+        browser.source_input_activity();
+        continue;
+      }
       if (event == Key::PairConfirm) {
         view = View::Pair;
         selected = 0;
@@ -328,15 +383,15 @@ extern "C" void app_main() {
         // accepting a fresh confirmation.
         if (event == Key::Previous) {
           enqueue("setup");
-          view = View::Articles;
+          view = View::Sources;
         } else if (event == Key::Next || event == Key::Menu)
-          view = View::Articles;
+          view = View::Sources;
         need_draw = true;
         continue;
       }
       if (event == Key::Check) {
         if (view == View::Articles) {
-          article_cursor.next_page(entries);
+          browser.cursor().next_page(entries);
           need_draw = true;
           continue;
         }
@@ -348,8 +403,12 @@ extern "C" void app_main() {
       }
       if (view == View::Reading) {
         if (event == Key::Menu) {
-          view = View::Articles;
-          article_cursor.focus(entries, current.source_id, current.document_id);
+          if (browser.focus(sources, current.source_id)) {
+            refresh_source_articles();
+            browser.cursor().focus(entries, current.source_id, current.document_id);
+            view = View::Articles;
+          } else
+            view = View::Sources;
           need_draw = true;
         } else if (!pages.empty() &&
                    (event == Key::Next || event == Key::Previous)) {
@@ -362,14 +421,14 @@ extern "C" void app_main() {
         }
       } else if (view == View::Menu) {
         if (event == Key::Menu) {
-          view = View::Articles;
+          view = View::Sources;
           need_draw = true;
         } else if (event == Key::Next) {
           selected = (selected + 1) % 7;
           need_draw = true;
         } else if (event == Key::Previous) {
           if (selected == 0) {
-            view = View::Articles;
+            view = View::Sources;
           } else if (selected == 1) {
             enqueue("check");
             view = View::Status;
@@ -407,46 +466,67 @@ extern "C" void app_main() {
             open_entry(current, true);
             view = View::Reading;
           } else
-            view = View::Articles;
+            view = View::Sources;
         }
         need_draw = true;
       } else if (view == View::Articles) {
         if (event == Key::Menu) {
-          view = View::Menu;
-          selected = 0;
+          view = View::Sources;
           need_draw = true;
         } else if (!entries.empty()) {
           if (event == Key::Next)
-            article_cursor.next(entries);
+            browser.cursor().next(entries);
           else if (event == Key::PreviousItem) {
-            article_cursor.previous(entries);
+            browser.cursor().previous(entries);
             ESP_LOGI("readocs", "previous item -> %d/%u",
-                     article_cursor.index() + 1,
+                     browser.cursor().index() + 1,
                      static_cast<unsigned>(entries.size()));
           } else if (event == Key::Previous) {
-            article_cursor.reconcile(entries);
-            open_entry(entries[article_cursor.index()]);
+            browser.cursor().reconcile(entries);
+            open_entry(entries[browser.cursor().index()]);
             view = View::Reading;
           }
           need_draw = true;
         }
+      } else if (view == View::Sources) {
+        if (event == Key::Menu) {
+          view = View::Menu;
+          selected = 0;
+        } else if (event == Key::Next || event == Key::PreviousItem) {
+          browser.move(sources, event == Key::Next ? 1 : -1);
+          refresh_source_articles();
+        } else if (event == Key::Previous && browser.can_open_source()) {
+          refresh_source_articles();
+          view = View::Articles;
+        }
+        need_draw = true;
       } else if (event == Key::Menu || event == Key::Previous) {
         view = View::Menu;
         selected = 0;
         need_draw = true;
       }
     }
-    bool changed = redraw.exchange(false);
+    if (view == View::Sources && browser.source_input_fenced()) {
+      browser.settle_source_input(input_idle.load(), keys_released(),
+                                   uxQueueMessagesWaiting(buttons) == 0, now_ms());
+      if (!browser.source_input_fenced() && deferred_pair_confirm) {
+        deferred_pair_confirm = false;
+        view = View::Pair;
+        selected = 0;
+        need_draw = true;
+      }
+    }
     if (changed && (view == View::Status || ap ||
                     (view == View::Reading && pages.empty())))
       need_draw = true;
     if (view == View::Reading && !current.document_id.empty() &&
         now_ms() - last_input >= 30000 && !networking) {
       auto it =
-          std::find_if(entries.begin(), entries.end(), [&](const Entry &e) {
-            return e.document_id == current.document_id;
+          std::find_if(all_entries.begin(), all_entries.end(), [&](const Entry &e) {
+            return e.source_id == current.source_id &&
+                   e.document_id == current.document_id;
           });
-      if (it != entries.end() && it->snapshot_id != current.snapshot_id &&
+      if (it != all_entries.end() && it->snapshot_id != current.snapshot_id &&
           !it->snapshot_id.empty()) {
         open_entry(*it);
         need_draw = true;
@@ -466,11 +546,23 @@ extern "C" void app_main() {
             : selected == 1 ? 24
                             : 32);
       else if (view == View::Menu)
-        draw_menu({"文章列表", "检查更新", "状态", "字号", "配网", "休眠",
+        draw_menu({"内容来源", "检查更新", "状态", "字号", "配网", "休眠",
                    "关机"},
                   selected, "菜单");
-      else if (view == View::Articles)
-        draw_articles(entries, article_cursor.index());
+      else if (view == View::Sources) {
+        draw_sources(sources, browser.index());
+        browser.source_rendered();
+        if (browser.source_input_fenced())
+          discard_invalid_source_backlog();
+      }
+      else if (view == View::Articles) {
+        auto source = std::find_if(sources.begin(), sources.end(), [&](const Source &s) {
+          return s.id == browser.source();
+        });
+        draw_articles(entries, browser.cursor().index(),
+                       source != sources.end() ? source->title : "文章列表",
+                       source != sources.end() ? source->count : 0);
+      }
       else if (view == View::Status)
         draw_message("状态",
                      {status, ssid,
@@ -489,22 +581,26 @@ extern "C" void app_main() {
     {
       std::lock_guard<std::mutex> g(model.mutex);
       model.view = view;
-      model.list_index = article_cursor.index();
-      model.selected_source = article_cursor.source();
-      model.selected_document = article_cursor.document();
+      model.source_index = browser.index();
+      model.list_index = view == View::Sources ? browser.index() : browser.cursor().index();
+      model.selected_source = browser.source();
+      model.selected_document = browser.cursor().document();
       model.page = page;
       model.page_count = pages.size();
     }
     retained_view = static_cast<int>(view);
     retained_selected = selected;
     std::snprintf(retained_list_source, sizeof(retained_list_source), "%s",
-                  article_cursor.source().c_str());
+                  browser.source().c_str());
     std::snprintf(retained_list_document, sizeof(retained_list_document), "%s",
-                  article_cursor.document().c_str());
+                  browser.cursor().document().c_str());
+    browser.retain(retained_source_selections, retained_source_count);
     if (!current.document_id.empty() && !pages.empty()) {
       retained_page = page;
       std::snprintf(retained_document, sizeof(retained_document), "%s",
                     current.document_id.c_str());
+      std::snprintf(retained_current_source, sizeof(retained_current_source), "%s",
+                    current.source_id.c_str());
     }
     const bool usb = pm1_vbus_voltage() > 4000;
     if (!ap && !networking && now_ms() - last_input >= 1000) {

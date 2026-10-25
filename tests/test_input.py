@@ -5,7 +5,15 @@ from pathlib import Path
 import pytest
 
 
-@pytest.mark.parametrize("source", ["input_logic.cpp", "navigation_logic.cpp"])
+@pytest.mark.parametrize(
+    "source",
+    [
+        "input_logic.cpp",
+        "navigation_logic.cpp",
+        "source_navigation.cpp",
+        "layout_width.cpp",
+    ],
+)
 def test_actual_firmware_input_logic(tmp_path, source):
     root = Path(__file__).resolve().parents[1]
     compiler = shutil.which("clang++") or shutil.which("g++")

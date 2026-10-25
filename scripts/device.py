@@ -49,9 +49,9 @@ def main():
             port.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
             port.flush()
             payload.clear()
-            # A command can queue behind an automatic sync; each network task
-            # has a 20-second budget. Leave time for both and USB scheduling.
-            deadline = time.monotonic() + 60
+            # A command can queue behind a 60-second article download, then
+            # use its own 20-second network budget. Allow USB scheduling too.
+            deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
                 line = port.readline().decode("utf-8", errors="replace").strip()
                 if line.startswith("ERROR "):
@@ -81,7 +81,7 @@ def main():
                 if kind == "RESULT" and not result["ok"]:
                     sys.exit(1)
                 return
-            sys.exit("设备未在 60 秒内返回结果，请查看屏幕或检查串口占用。")
+            sys.exit("设备未在 90 秒内返回结果，请查看屏幕或检查串口占用。")
     except serial.SerialException:
         sys.exit("USB 连接失败或串口被占用，请关闭其他串口监视器后重试。")
 

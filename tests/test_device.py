@@ -88,18 +88,24 @@ def test_status_ignores_background_results(device_tool, monkeypatch, capsys):
     assert capsys.readouterr().out == 'STATUS {"busy":false}\n'
 
 
-def test_queued_command_has_time_after_automatic_sync(device_tool, monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "queued_action, reply_times",
+    [("sync", [1, 20, 36, 40]), ("download", [1, 60, 75, 80])],
+)
+def test_queued_command_has_time_after_network_action(
+    device_tool, monkeypatch, capsys, queued_action, reply_times
+):
     clock = [0]
     replies = SerialReplies(
         [
             "ACCEPTED check",
-            'RESULT {"command":"sync","ok":true}',
+            'RESULT ' + json.dumps({"command": queued_action, "ok": True}),
             "waiting",
             'RESULT {"command":"check","ok":true}',
         ]
     )
     next_line = replies.readline
-    times = iter([1, 20, 36, 40])
+    times = iter(reply_times)
 
     def readline():
         clock[0] = next(times)
@@ -110,7 +116,7 @@ def test_queued_command_has_time_after_automatic_sync(device_tool, monkeypatch, 
     monkeypatch.setattr(device_tool.serial, "Serial", lambda *a, **k: replies)
     monkeypatch.setattr(sys, "argv", ["device.py", "check"])
     device_tool.main()
-    assert clock[0] == 40 and replies.reads == 4
+    assert clock[0] == reply_times[-1] and replies.reads == 4
     assert capsys.readouterr().out == 'RESULT {"command":"check","ok":true}\n'
 
 

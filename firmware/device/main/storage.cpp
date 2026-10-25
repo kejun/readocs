@@ -1,6 +1,8 @@
 #include "readocs.hpp"
 #include "cache_file.hpp"
 #include "position_storage.hpp"
+#include "source_metadata.hpp"
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -55,6 +57,35 @@ static std::string get_string(const char *key) {
     out.pop_back();
   return out;
 }
+static bool cache_pointer(const char *key, std::string &out) {
+  size_t size = 0;
+  auto err = nvs_get_str(handle, key, nullptr, &size);
+  if (err == ESP_ERR_NVS_NOT_FOUND) {
+    out.clear();
+    return true;
+  }
+  if (err == ESP_OK && size != 65)
+    err = ESP_ERR_INVALID_SIZE;
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "cache gc aborted stage=pointer key=%s err=%s", key,
+             esp_err_to_name(err));
+    return false;
+  }
+  std::string value(size, '\0');
+  err = nvs_get_str(handle, key, value.data(), &size);
+  if (err != ESP_OK || size != 65 || value.back() != '\0') {
+    ESP_LOGW(TAG, "cache gc aborted stage=pointer_read key=%s err=%s", key,
+             esp_err_to_name(err));
+    return false;
+  }
+  value.pop_back();
+  if (!valid_hash(value)) {
+    ESP_LOGW(TAG, "cache gc aborted stage=pointer_hash key=%s", key);
+    return false;
+  }
+  out = std::move(value);
+  return true;
+}
 static std::string get_positions() {
   return read_position_map(handle);
 }
@@ -106,7 +137,7 @@ void clear_directory_progress() {
     std::remove(("/cache/" + id).c_str());
 }
 static bool load_index(const std::string &id, std::vector<Entry> &out,
-                       std::string &etag) {
+                       std::string &etag, std::vector<Source> &sources) {
   if (!valid_hash(id))
     return false;
   auto body = read_file(id, 512 * 1024);
@@ -130,8 +161,18 @@ static bool load_index(const std::string &id, std::vector<Entry> &out,
     }
     entries.push_back(e);
   }
+  std::vector<Source> declared;
+  auto *metadata = cJSON_GetObjectItemCaseSensitive(root.get(), "sources");
+  if (metadata ? !read_source_metadata(metadata, declared)
+               : !infer_source_metadata(entries, declared))
+    return false;
+  if (!source_entries_valid(entries, declared))
+    return false;
   out = std::move(entries);
-  etag = str(root.get(), "etag");
+  sources = std::move(declared);
+  // A legacy index cannot reveal empty sources or their real display names.
+  // Force one manifest response instead of letting its old ETag return 304.
+  etag = metadata ? str(root.get(), "etag") : "";
   return true;
 }
 bool load_storage() {
@@ -202,8 +243,8 @@ bool load_storage() {
     ESP_LOGE(TAG, "Cache mount failed: %s", esp_err_to_name(err));
     return false;
   }
-  if (!load_index(get_string("active"), model.entries, model.etag))
-    load_index(get_string("previous"), model.entries, model.etag);
+  if (!load_index(get_string("active"), model.entries, model.etag, model.sources))
+    load_index(get_string("previous"), model.entries, model.etag, model.sources);
   model.displayed_snapshot = get_string("displayed");
   Json pos(cJSON_Parse(get_string("position").c_str()));
   if (pos) {
@@ -215,14 +256,33 @@ bool load_storage() {
   }
   return true;
 }
-bool commit_cache(const std::vector<Entry> &entries, const std::string &etag) {
-  for (const auto &e : entries)
-    if (!e.snapshot_id.empty() &&
-        sha256(read_file(e.snapshot_id)) != e.snapshot_id)
-      return false;
+static bool cache_commit_failure(const char *stage, int saved_errno = 0,
+                                  esp_err_t nvs_error = ESP_OK, size_t bytes = 0) {
+  size_t total = 0, used = 0;
+  const auto info = esp_spiffs_info("cache", &total, &used);
+  ESP_LOGE(TAG,
+           "cache commit stage=%s errno=%d nvs=%s bytes=%u used=%u total=%u info=%s",
+           stage, saved_errno, esp_err_to_name(nvs_error),
+           static_cast<unsigned>(bytes), static_cast<unsigned>(used),
+           static_cast<unsigned>(total), esp_err_to_name(info));
+  return false;
+}
+bool commit_cache(const std::vector<Entry> &entries, const std::string &etag,
+                  const std::vector<Source> &sources) {
+  if (!source_entries_valid(entries, sources))
+    return cache_commit_failure("source_map");
+  for (const auto &e : entries) {
+    if (e.snapshot_id.empty())
+      continue;
+    errno = 0;
+    auto body = read_file(e.snapshot_id);
+    if (sha256(body) != e.snapshot_id)
+      return cache_commit_failure("body_verify", errno, ESP_OK, body.size());
+  }
   Json root(cJSON_CreateObject());
   cJSON_AddNumberToObject(root.get(), "schema_version", 1);
   cJSON_AddStringToObject(root.get(), "etag", etag.c_str());
+  write_source_metadata(root.get(), sources);
   auto *a = cJSON_AddArrayToObject(root.get(), "entries");
   for (const auto &e : entries) {
     auto *j = cJSON_CreateObject();
@@ -234,17 +294,28 @@ bool commit_cache(const std::vector<Entry> &entries, const std::string &etag) {
   }
   auto body = serialize(root.get()), id = sha256(body);
   if (body.size() > 512 * 1024)
-    return false;
+    return cache_commit_failure("index_size", 0, ESP_OK, body.size());
   if (id == get_string("active"))
     return true;
+  errno = 0;
   if (!write_file(id, body))
-    return false;
+    return cache_commit_failure("index_write", errno, ESP_OK, body.size());
   auto old = get_string("active");
-  if (!old.empty() && (nvs_set_str(handle, "previous", old.c_str()) != ESP_OK ||
-                       nvs_commit(handle) != ESP_OK))
-    return false;
-  return nvs_set_str(handle, "active", id.c_str()) == ESP_OK &&
-         nvs_commit(handle) == ESP_OK;
+  if (!old.empty()) {
+    auto err = nvs_set_str(handle, "previous", old.c_str());
+    if (err != ESP_OK)
+      return cache_commit_failure("previous_set", 0, err);
+    err = nvs_commit(handle);
+    if (err != ESP_OK)
+      return cache_commit_failure("previous_commit", 0, err);
+  }
+  auto err = nvs_set_str(handle, "active", id.c_str());
+  if (err != ESP_OK)
+    return cache_commit_failure("active_set", 0, err);
+  err = nvs_commit(handle);
+  if (err != ESP_OK)
+    return cache_commit_failure("active_commit", 0, err);
+  return true;
 }
 void save_position(const Position &p) {
   Json j(cJSON_CreateObject());
@@ -284,49 +355,77 @@ Position load_position(const std::string &doc) {
   return {str(p, "document"), str(p, "block"), str(p, "snapshot"),
           static_cast<unsigned>(num(p, "offset")), num(p, "page")};
 }
+static bool mark_cache_links(const std::string &id, bool progress,
+                              std::set<std::string> &keep) {
+  auto body = read_file(id, 512 * 1024);
+  if (sha256(body) != id) {
+    ESP_LOGW(TAG, "cache gc aborted stage=graph_read progress=%d bytes=%u",
+             progress, static_cast<unsigned>(body.size()));
+    return false;
+  }
+  Json root(cJSON_Parse(body.c_str()));
+  auto *entries = cJSON_GetObjectItemCaseSensitive(root.get(), "entries");
+  if (!root || !cJSON_IsObject(root.get()) || !cJSON_IsArray(entries) ||
+      (!progress && num(root.get(), "schema_version") != 1)) {
+    ESP_LOGW(TAG, "cache gc aborted stage=graph_structure progress=%d", progress);
+    return false;
+  }
+  if (progress) {
+    auto hash = str(root.get(), "hash");
+    cJSON_DeleteItemFromObjectCaseSensitive(root.get(), "hash");
+    if (!valid_hash(hash) || sha256(serialize(root.get())) != hash) {
+      ESP_LOGW(TAG, "cache gc aborted stage=progress_hash");
+      return false;
+    }
+  }
+  keep.insert(id);
+  cJSON *entry;
+  cJSON_ArrayForEach(entry, entries) {
+    auto *snapshot = cJSON_GetObjectItemCaseSensitive(entry, "snapshot_id");
+    if (!cJSON_IsObject(entry) || !cJSON_IsString(snapshot) ||
+        (snapshot->valuestring[0] && !valid_hash(snapshot->valuestring))) {
+      ESP_LOGW(TAG, "cache gc aborted stage=graph_entry progress=%d", progress);
+      return false;
+    }
+    if (snapshot->valuestring[0])
+      keep.insert(snapshot->valuestring);
+  }
+  return true;
+}
 void collect_cache(bool reclaim_previous) {
+  std::string active, previous, staged, displayed;
+  if (!cache_pointer("active", active) || !cache_pointer("previous", previous) ||
+      !cache_pointer("catalog_stage", staged) ||
+      !cache_pointer("displayed", displayed))
+    return;
+  std::set<std::string> keep, previous_keep;
+  if (!active.empty() && !mark_cache_links(active, false, keep))
+    return;
+  if (!previous.empty() && previous != active &&
+      !mark_cache_links(previous, false, previous_keep))
+    return;
+  if (!staged.empty() && !mark_cache_links(staged, true, keep))
+    return;
   if (reclaim_previous) {
     // Reclaim an older fallback only after proving the current active index
     // and every body it references are complete. The active index then stays
     // pinned throughout downloads and becomes previous at the next commit.
-    const auto active = get_string("active");
     std::vector<Entry> verified;
+    std::vector<Source> sources;
     std::string etag;
-    if (active != get_string("previous") &&
-        load_index(active, verified, etag)) {
+    if (!active.empty() && active != previous &&
+        load_index(active, verified, etag, sources)) {
       if (nvs_set_str(handle, "previous", active.c_str()) != ESP_OK ||
-          nvs_commit(handle) != ESP_OK)
+          nvs_commit(handle) != ESP_OK) {
         ESP_LOGW(TAG, "Unable to reclaim previous cache version");
+        return;
+      }
+      previous = active;
+      previous_keep.clear();
     }
   }
-  std::set<std::string> keep;
-  for (const char *key : {"active", "previous"}) {
-    auto id = get_string(key);
-    if (!valid_hash(id))
-      continue;
-    keep.insert(id);
-    Json root(cJSON_Parse(read_file(id, 512 * 1024).c_str()));
-    cJSON *e;
-    cJSON_ArrayForEach(
-        e, cJSON_GetObjectItemCaseSensitive(root.get(), "entries")) {
-      auto snapshot = str(e, "snapshot_id");
-      if (valid_hash(snapshot))
-        keep.insert(snapshot);
-    }
-  }
-  auto staged = get_string("catalog_stage");
-  if (valid_hash(staged))
-    keep.insert(staged);
-  Json pending(cJSON_Parse(directory_progress().c_str()));
-  cJSON *item;
-  cJSON_ArrayForEach(
-      item, cJSON_GetObjectItemCaseSensitive(pending.get(), "entries")) {
-    auto snapshot = str(item, "snapshot_id");
-    if (valid_hash(snapshot))
-      keep.insert(snapshot);
-  }
-  auto displayed = get_string("displayed");
-  if (valid_hash(displayed))
+  keep.insert(previous_keep.begin(), previous_keep.end());
+  if (!displayed.empty())
     keep.insert(displayed);
   DIR *dir = opendir("/cache");
   if (!dir)
