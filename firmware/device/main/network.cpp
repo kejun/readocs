@@ -2,6 +2,7 @@
 #include "cache_policy.hpp"
 #include "readocs.hpp"
 #include "source_metadata.hpp"
+#include "ui_power_policy.hpp"
 #include <algorithm>
 #include <cstring>
 #include <ctime>
@@ -937,9 +938,16 @@ void init_network() {
 }
 static void status_console() {
   Json j(cJSON_CreateObject());
-  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.3");
+  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.4");
   cJSON_AddBoolToObject(j.get(), "connected", connected.load());
   cJSON_AddBoolToObject(j.get(), "busy", networking.load());
+  cJSON_AddNumberToObject(j.get(), "uptime_ms", now_ms());
+  cJSON_AddNumberToObject(j.get(), "light_sleeps", light_sleep_count());
+  cJSON_AddBoolToObject(j.get(), "light_sleep_available", light_sleep_available());
+  cJSON_AddNumberToObject(j.get(), "interaction_window_ms", ui_interaction_ms);
+  Json sleep_probe(cJSON_Parse(load_sleep_probe().c_str()));
+  if (cJSON_IsObject(sleep_probe.get()))
+    cJSON_AddItemToObject(j.get(), "light_sleep_probe", sleep_probe.release());
   {
     std::lock_guard<std::mutex> g(model.mutex);
     cJSON_AddStringToObject(j.get(), "status", model.status.c_str());
@@ -1028,7 +1036,10 @@ void console_task(void *) {
     auto cmd = str(j.get(), "cmd");
     if (cmd == "status")
       status_console();
-    else if (cmd == "next" || cmd == "previous" || cmd == "prev_item" ||
+    else if (cmd == "light_sleep_probe") {
+      request_light_sleep_probe();
+      std::printf("ACCEPTED light_sleep_probe\n");
+    } else if (cmd == "next" || cmd == "previous" || cmd == "prev_item" ||
              cmd == "menu" || cmd == "hold_a") {
       Key key = cmd == "next"       ? Key::Next
                 : cmd == "previous" ? Key::Previous
@@ -1092,6 +1103,11 @@ void network_task(void *) {
     }
     std::unique_ptr<Action> action(ptr);
     networking = true;
+    {
+      // A manual UI light sleep pauses both CPUs. Wait for its return before
+      // starting Wi-Fi, TLS, filesystem, or HTTP operations.
+      std::lock_guard<std::mutex> awake(ui_sleep_mutex);
+    }
     deadline = now_ms() + (action->type == "download" ? 60000 : 20000);
     http_retry_used = false;
     error_text.clear();

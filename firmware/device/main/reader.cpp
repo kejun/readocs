@@ -35,7 +35,8 @@ static bool sources_valid = false;
 static std::string sources_signature;
 static int sources_selected = -1, sources_start = -1;
 static bool page_valid = false;
-static std::string page_document, page_snapshot;
+static std::string page_source, page_document, page_snapshot, page_title;
+static std::string metadata_snapshot, content_timestamp;
 static unsigned page_font_size = 0;
 static int page_index = -1, page_count = 0;
 
@@ -272,16 +273,16 @@ static void finish(const std::string &snapshot = "") {
   display_marker(false, snapshot);
   quality_full_draw = false;
 }
-static void finish_partial() {
+static void finish_partial(int x, int y, int w, int h) {
   M5.Display.setEpdMode(kPartialMode);
   const int64_t started = esp_timer_get_time();
-  M5.Display.display();
+  M5.Display.display(x, y, w, h);
   M5.Display.waitDisplay();
   const int count = partial_updates.fetch_add(1) + 1;
-  ESP_LOGI("readocs", "epd partial mode=%s time_ms=%d partial=%d/%d",
+  ESP_LOGI("readocs", "epd partial mode=%s time_ms=%d partial=%d/%d rect=%d,%d,%d,%d",
            epd_mode_name(static_cast<int>(kPartialMode)),
            static_cast<int>((esp_timer_get_time() - started) / 1000), count,
-           partial_limit.load());
+           partial_limit.load(), x, y, w, h);
 }
 
 bool quality_cleanup_due() {
@@ -306,10 +307,13 @@ void draw_page(const Entry &e, const std::vector<Page> &pages, int index) {
     std::lock_guard<std::mutex> g(model.mutex);
     size = model.config.font_size;
   }
-  const bool partial =
-      page_valid && page_document == e.document_id &&
+  const bool same_layout =
+      page_valid && page_source == e.source_id && page_document == e.document_id &&
       page_snapshot == e.snapshot_id && page_font_size == size &&
-      page_count == static_cast<int>(pages.size()) && page_index != index &&
+      page_title == e.title && page_count == static_cast<int>(pages.size());
+  if (same_layout && page_index == index && !quality_cleanup_due())
+    return;
+  const bool partial = same_layout && page_index != index &&
       !force_quality.load() && partial_updates.load() < partial_limit.load();
   if (partial) {
     // A page turn only changes the body and footer. Keep the title and its rule
@@ -345,19 +349,24 @@ void draw_page(const Entry &e, const std::vector<Page> &pages, int index) {
   d.print("A 下一页   B 上一页   按住 B 列表");
   d.setCursor(32, 922);
   d.printf("%d / %u", index + 1, static_cast<unsigned>(pages.size()));
-  Json doc(cJSON_Parse(read_file(e.snapshot_id).c_str()));
-  auto updated = str(doc.get(), "content_updated_at");
-  if (!updated.empty()) {
+  if (metadata_snapshot != e.snapshot_id) {
+    Json doc(cJSON_Parse(read_file(e.snapshot_id).c_str()));
+    content_timestamp = str(doc.get(), "content_updated_at");
+    metadata_snapshot = e.snapshot_id;
+  }
+  if (!content_timestamp.empty()) {
     d.setCursor(245, 922);
-    d.print(updated.substr(0, 19).c_str());
+    d.print(content_timestamp.substr(0, 19).c_str());
   }
   if (partial)
-    finish_partial();
+    finish_partial(0, 63, d.width(), d.height() - 63);
   else
     finish(e.snapshot_id);
   page_valid = true;
+  page_source = e.source_id;
   page_document = e.document_id;
   page_snapshot = e.snapshot_id;
+  page_title = e.title;
   page_font_size = size;
   page_index = index;
   page_count = static_cast<int>(pages.size());
@@ -397,9 +406,12 @@ static std::vector<std::string> article_title(const std::string &title) {
   }
   return lines;
 }
-static std::string article_signature_of(const std::vector<Entry> &entries) {
+static std::string article_signature_of(const std::vector<Entry> &entries,
+                                         int start) {
   std::string signature = std::to_string(entries.size());
-  for (const auto &entry : entries) {
+  const int end = std::min(start + article_page_size, static_cast<int>(entries.size()));
+  for (int i = start; i < end; ++i) {
+    const auto &entry = entries[i];
     signature += '\n';
     signature += entry.source_id;
     signature += '\x1f';
@@ -407,7 +419,7 @@ static std::string article_signature_of(const std::vector<Entry> &entries) {
     signature += '\x1f';
     signature += entry.title;
     signature += '\x1f';
-    signature += entry.snapshot_id;
+    signature += entry.snapshot_id.empty() ? '0' : '1';
   }
   return signature;
 }
@@ -516,7 +528,7 @@ void draw_sources(const std::vector<Source> &sources, int selected) {
     draw_source_row(sources, selected, sources_selected, old_y);
     draw_source_row(sources, selected, selected, new_y);
     d.clearClipRect();
-    finish_partial();
+    finish_partial(24, top, 492, bottom - top);
     sources_selected = selected;
     return;
   }
@@ -548,12 +560,14 @@ void draw_sources(const std::vector<Source> &sources, int selected) {
 void draw_articles(const std::vector<Entry> &entries, int selected,
                    const std::string &source_title, int source_count) {
   auto &d = M5.Display;
-  const std::string signature = source_title + '\n' + std::to_string(source_count) +
-                                '\n' + article_signature_of(entries);
   if (!entries.empty())
     selected = std::clamp(selected, 0, static_cast<int>(entries.size()) - 1);
   const int start =
       entries.empty() ? 0 : selected / article_page_size * article_page_size;
+  // Only pixels on this screen determine its baseline. An offscreen download
+  // or a new hash for an already-cached body must not force a full list redraw.
+  const std::string signature = source_title + '\n' + std::to_string(source_count) +
+                                '\n' + article_signature_of(entries, start);
   if (articles_valid && signature == articles_signature && start == articles_start) {
     if (selected == articles_selected)
       return;
@@ -566,7 +580,7 @@ void draw_articles(const std::vector<Entry> &entries, int selected,
     draw_article_row(entries, selected, articles_selected, old_y);
     draw_article_row(entries, selected, selected, new_y);
     d.clearClipRect();
-    finish_partial();
+    finish_partial(24, top, 492, bottom - top);
     articles_selected = selected;
     return;
   }
@@ -626,7 +640,7 @@ void draw_menu(const std::vector<std::string> &options, int selected,
     draw_menu_row(options, selected, menu_selected, old_y);
     draw_menu_row(options, selected, selected, new_y);
     d.clearClipRect();
-    finish_partial();
+    finish_partial(24, top, 492, bottom - top);
     menu_selected = selected;
     return;
   }
@@ -739,7 +753,6 @@ void request_display_probe(int mode, int area, int count) {
 bool run_display_probe() {
   if (!probe_pending.exchange(false))
     return false;
-  invalidate_navigation();
   invalidate_navigation();
   auto &d = M5.Display;
   d.display();

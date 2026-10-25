@@ -71,6 +71,8 @@ struct Model {
   bool ap = false, initialized = false, sync_pending = false;
 };
 extern Model model;
+// Network work must not start while the whole chip is in manual light sleep.
+extern std::mutex ui_sleep_mutex;
 extern std::atomic<bool> connected, networking, redraw, setup_requested;
 extern std::atomic<bool> input_idle;
 extern std::atomic<int64_t> last_input, ap_activity;
@@ -82,6 +84,13 @@ void power_key_prepare_sleep();
 void power_key_shutdown();
 uint16_t pm1_vbus_voltage();
 uint8_t pm1_register(uint8_t reg);
+bool light_sleep_ui();
+bool light_sleep_available();
+unsigned light_sleep_count();
+void request_light_sleep_probe();
+void run_light_sleep_probe();
+bool save_sleep_probe(const std::string &json);
+std::string load_sleep_probe();
 struct Action {
   std::string type, json;
 };

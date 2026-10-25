@@ -89,6 +89,13 @@ static bool cache_pointer(const char *key, std::string &out) {
 static std::string get_positions() {
   return read_position_map(handle);
 }
+// Explicit diagnostics only; ordinary light-sleep cycles never write NVS.
+bool save_sleep_probe(const std::string &json) {
+  return json.size() <= 1024 &&
+         nvs_set_str(handle, "sleep_probe", json.c_str()) == ESP_OK &&
+         nvs_commit(handle) == ESP_OK;
+}
+std::string load_sleep_probe() { return get_string("sleep_probe"); }
 bool save_config(const Config &c) {
   Json root(cJSON_CreateObject());
   auto *a = cJSON_AddArrayToObject(root.get(), "networks");

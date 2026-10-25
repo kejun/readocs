@@ -1,4 +1,5 @@
 #include "readocs.hpp"
+#include "ui_power_policy.hpp"
 #include <algorithm>
 #include <ctime>
 #include <driver/gpio.h>
@@ -15,6 +16,7 @@
 
 namespace rd {
 Model model;
+std::mutex ui_sleep_mutex;
 std::atomic<bool> connected{false}, networking{false}, redraw{true},
     setup_requested{false};
 std::atomic<int64_t> last_input{0}, ap_activity{0};
@@ -160,6 +162,7 @@ extern "C" void app_main() {
           : ESP_ERR_NO_MEM);
   auto wake = esp_sleep_get_wakeup_cause();
   bool cold = wake == ESP_SLEEP_WAKEUP_UNDEFINED;
+  bool interactive = cold || wake == ESP_SLEEP_WAKEUP_EXT1;
   if (!storage_ok)
     draw_message("缓存需要维护", {"旧分区已保留，请通过 USB 检查"});
   if (model.config.networks.empty())
@@ -279,7 +282,10 @@ extern "C" void app_main() {
     browser.cursor().reconcile(entries);
   if (view == View::Reading && current.document_id.empty())
     view = View::Sources;
-  bool need_draw = cold || !restored_source || display_pending();
+  const bool interrupted_display = display_pending();
+  if (interrupted_display)
+    request_quality_cleanup();
+  bool need_draw = cold || !restored_source || interrupted_display;
   std::string last_status;
   bool previous_busy = false, ap_was = false;
   int64_t last_check = 0;
@@ -291,6 +297,7 @@ extern "C" void app_main() {
     }
     if (run_display_probe())
       need_draw = true;
+    run_light_sleep_probe();
     std::string status, ssid, ap_ssid, ap_password;
     bool ap, sync_pending;
     bool catalog_changed = false, selected_source_preserved = true;
@@ -360,6 +367,7 @@ extern "C" void app_main() {
     bool handled = false;
     while (xQueueReceive(buttons, &event, 0) == pdTRUE) {
       handled = true;
+      interactive = true;
       const int64_t lag = now_ms() - last_input;
       if (lag > 250)
         ESP_LOGI("readocs", "key lag=%lld ms", static_cast<long long>(lag));
@@ -611,7 +619,15 @@ extern "C" void app_main() {
         last_input = now_ms();
         continue;
       }
-      if (!usb)
+      const auto idle_mode = ui_idle_policy(
+          usb, ui_idle(), interactive && light_sleep_available(),
+          now_ms() - last_input);
+      if (idle_mode == UiIdle::LightSleep && light_sleep_ui()) {
+        // Let IDLE service the watchdog before suspending the chip again.
+        vTaskDelay(1);
+        continue;
+      }
+      if (idle_mode == UiIdle::DeepSleep)
         sleep_now(false, true);
     }
     if (usb && !ap && !networking && std::time(nullptr) >= next_sync_at &&
