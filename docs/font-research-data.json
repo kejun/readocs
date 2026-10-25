@@ -1,0 +1,214 @@
+{
+  "date": "2026-10-25",
+  "scope": "Host-side research; no firmware change or device flash",
+  "converter": "lv_font_conv@1.5.3",
+  "format": "BFF binary; default RLE/XOR compression; no kerning; autohint light; no LCD subpixels",
+  "charset": "All GB2312 characters, ASCII 0x20-0x7e, and •…—–─│",
+  "charset_count": 7543,
+  "charset_sha256": "bbb358b49f3541d7844e8e02d95cce3402e7edb4590eb8bf92b37f2caf0c1238",
+  "sizes_px": [
+    16,
+    24,
+    32
+  ],
+  "source_files": [
+    {
+      "name": "NotoSansSC-Regular.otf",
+      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf",
+      "bytes": 8331336,
+      "sha256": "faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9"
+    },
+    {
+      "name": "NotoSerifSC-Regular.otf",
+      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Serif/SubsetOTF/SC/NotoSerifSC-Regular.otf",
+      "bytes": 11625800,
+      "sha256": "e8f396decc1f0963a016a989c3d8852e863d1350996f573860a80767c83a1cd3"
+    },
+    {
+      "name": "LXGWWenKaiGBScreen.ttf",
+      "url": "https://github.com/lxgw/LxgwWenKai-Screen/releases/download/v1.530/LXGWWenKaiGBScreen.ttf",
+      "bytes": 26456786,
+      "sha256": "0df4009ac9dce6eb3b8cb4c4e90de67bb9745e8992a255c03a58dd5fe3f1e503"
+    },
+    {
+      "name": "NotoEmoji.ttf",
+      "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/notoemoji/NotoEmoji%5Bwght%5D.ttf",
+      "bytes": 1982596,
+      "sha256": "de6c18832938afc99caf132b39d6a30a19bac7f2e812e28db2535b4608d27551"
+    },
+    {
+      "name": "NotoSans-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/LICENSE",
+      "bytes": 4301,
+      "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+    },
+    {
+      "name": "NotoSerif-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Serif/LICENSE",
+      "bytes": 4301,
+      "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+    },
+    {
+      "name": "WenKai-OFL.txt",
+      "url": "https://raw.githubusercontent.com/lxgw/LxgwWenKai-Screen/main/OFL.txt",
+      "bytes": 6027,
+      "sha256": "ba38832f9d7e0ad601a1ab90d58f251ba957532885ef80dca050a611962fd8b6"
+    },
+    {
+      "name": "NotoEmoji-OFL.txt",
+      "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/notoemoji/OFL.txt",
+      "bytes": 4330,
+      "sha256": "500bb1ccf43df7bbb522112f9133a52b16e1c35e809632f5d8609b179152de5b"
+    }
+  ],
+  "measurements": [
+    {
+      "font": "NotoSansSC-Regular.otf",
+      "size_px": 16,
+      "bpp": 4,
+      "bytes": 775912,
+      "sha256": "3337ded60cccf4d07a0f2ff4ad741658b4f8d4b2f60e4303113099d3828e442e"
+    },
+    {
+      "font": "NotoSansSC-Regular.otf",
+      "size_px": 24,
+      "bpp": 4,
+      "bytes": 1374912,
+      "sha256": "3e408d83317f89c3ebf1e006bcfb7c83622f97ab563c9fbb4a79ba0ab17dfca1"
+    },
+    {
+      "font": "NotoSansSC-Regular.otf",
+      "size_px": 32,
+      "bpp": 4,
+      "bytes": 1990000,
+      "sha256": "6d7e6683506dbf0f12af93ea6c71fdedc5cc77a90bea0b75576ff4c7e827897e"
+    },
+    {
+      "font": "NotoSerifSC-Regular.otf",
+      "size_px": 16,
+      "bpp": 4,
+      "bytes": 797844,
+      "sha256": "56254f943ae9b0ac20ac4606777943cdb0ecaab5904fffa75f4bc775c25fe8d6"
+    },
+    {
+      "font": "NotoSerifSC-Regular.otf",
+      "size_px": 24,
+      "bpp": 4,
+      "bytes": 1396836,
+      "sha256": "600a331a3f8e4973f380772da06f4d318b5d7b15668cf53ffa0c5c96e83127cb"
+    },
+    {
+      "font": "NotoSerifSC-Regular.otf",
+      "size_px": 32,
+      "bpp": 4,
+      "bytes": 2053356,
+      "sha256": "2c734f7ed08c4f0de7310c2dbe918e8c3f4c56452472e0324c8d389ea6c2affa"
+    },
+    {
+      "font": "LXGWWenKaiGBScreen.ttf",
+      "size_px": 16,
+      "bpp": 4,
+      "bytes": 820708,
+      "sha256": "316974b64d006e287a411151b9fba0c10a3150e407d0c2fae2a7693cebb34417"
+    },
+    {
+      "font": "LXGWWenKaiGBScreen.ttf",
+      "size_px": 24,
+      "bpp": 4,
+      "bytes": 1525196,
+      "sha256": "7a7175e762586436ff9cd7e0e3f894295ee4fce1bfb93aaaba3811537411a81a"
+    },
+    {
+      "font": "LXGWWenKaiGBScreen.ttf",
+      "size_px": 32,
+      "bpp": 4,
+      "bytes": 2424220,
+      "sha256": "49a7ab4e1a252698d8f37c563a01d3eef4cce5986e4c961695b6b8b7b43d6ea7"
+    },
+    {
+      "font": "NotoSansSC-Regular.otf",
+      "size_px": 16,
+      "bpp": 1,
+      "bytes": 256808,
+      "sha256": "3a6e2c6d58dea87e429cd393c01fb268fd90f908554a6836013929bcfd79e88d"
+    },
+    {
+      "font": "NotoSansSC-Regular.otf",
+      "size_px": 16,
+      "bpp": 2,
+      "bytes": 449084,
+      "sha256": "31e298a5dfca5dec7e730dc4f3089a3843f7fd5e1047f244521d2734560bfbff"
+    },
+    {
+      "font": "NotoSansSC-Regular.otf",
+      "size_px": 24,
+      "bpp": 1,
+      "bytes": 501428,
+      "sha256": "642e35c2a242e4ff9fa584ca5f0984b94042c80191cb06da9bd48bb3327e6a67"
+    },
+    {
+      "font": "NotoSansSC-Regular.otf",
+      "size_px": 24,
+      "bpp": 2,
+      "bytes": 806472,
+      "sha256": "699f7550c8092874d5e589e41c93145b73a4cdc3c6041cd5a9224f34d0db2ceb"
+    },
+    {
+      "font": "NotoSansSC-Regular.otf",
+      "size_px": 32,
+      "bpp": 1,
+      "bytes": 838340,
+      "sha256": "42d13fafab79c7efbf0e3ad026eca80c90aca03d004b52e28df7c91b3ff550d9"
+    },
+    {
+      "font": "NotoSansSC-Regular.otf",
+      "size_px": 32,
+      "bpp": 2,
+      "bytes": 1156376,
+      "sha256": "8df6c10d540f0a23ea5f52ce62307f865f8678893e417a45f11e16f77f5e948f"
+    },
+    {
+      "font": "NotoSerifSC-Regular.otf",
+      "size_px": 16,
+      "bpp": 1,
+      "bytes": 272028,
+      "sha256": "8fc7549ff4e5006fe42707c200d43aa1596cb1c627f554f2e861f9b4b58d7709"
+    },
+    {
+      "font": "NotoSerifSC-Regular.otf",
+      "size_px": 24,
+      "bpp": 1,
+      "bytes": 519620,
+      "sha256": "176e5560836d684399da2b257047b5179eac316022801190476dfe1fc3a7f631"
+    },
+    {
+      "font": "NotoSerifSC-Regular.otf",
+      "size_px": 32,
+      "bpp": 1,
+      "bytes": 853808,
+      "sha256": "e5059a407fa5abc72f523c495d20673cbca6f7564095d4f9164ac1da9abdd154"
+    },
+    {
+      "font": "LXGWWenKaiGBScreen.ttf",
+      "size_px": 16,
+      "bpp": 1,
+      "bytes": 262216,
+      "sha256": "eb31528401c7c7146e7b1bb6edd78df7a3ff259647874cac9a0cea9536a90587"
+    },
+    {
+      "font": "LXGWWenKaiGBScreen.ttf",
+      "size_px": 24,
+      "bpp": 1,
+      "bytes": 491120,
+      "sha256": "7c200b2f91a5dbf3f2ef13b21796a99155cdcf40d115f0f011f9e1b6586ae249"
+    },
+    {
+      "font": "LXGWWenKaiGBScreen.ttf",
+      "size_px": 32,
+      "bpp": 1,
+      "bytes": 827424,
+      "sha256": "42a98da0c52eaa6b4600535164d641651d6edf62d130442dc0a9940752e1bd9f"
+    }
+  ],
+  "preview": "Current efont decoded from pinned M5GFX data; vector overview uses Pillow/FreeType; fast-native preview uses lv_font_conv 1bpp dump glyphs. Host pixels only, not physical e-paper evidence."
+}
