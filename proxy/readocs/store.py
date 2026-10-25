@@ -11,6 +11,7 @@ from cryptography.fernet import Fernet
 from .dates import article_order, upstream_time
 
 DOWNLOAD_LEASE = 86400
+FEISHU_INTERVAL = 3 * 60 * 60
 
 
 def canonical(value) -> bytes:
@@ -110,6 +111,31 @@ class Store:
             self.db.execute(
                 "ALTER TABLE sources ADD COLUMN feed_members_known INTEGER NOT NULL DEFAULT 0"
             )
+        source = self.source("feishu")
+        if (
+            source
+            and source["kind"] == "feishu"
+            and source["interval"] != FEISHU_INTERVAL
+        ):
+            delta = FEISHU_INTERVAL - source["interval"]
+            scan = self.get("feishu_scan")
+            with self.db:
+                # Re-evaluate the local schedule once. Keep initial downloads,
+                # manual refreshes (due=0) and existing failure retries runnable.
+                self.db.execute(
+                    "UPDATE sources SET interval=?,due=CASE WHEN failures=0 THEN 0 ELSE due END WHERE id='feishu'",
+                    (FEISHU_INTERVAL,),
+                )
+                self.db.execute(
+                    "UPDATE feishu_items SET due=due+? WHERE due>0 AND failures=0",
+                    (delta,),
+                )
+                if scan and scan["next"] > 0:
+                    scan["next"] += delta
+                    self.db.execute(
+                        "UPDATE settings SET value=? WHERE key='feishu_scan'",
+                        (self.encrypt(scan),),
+                    )
         # Recover the previous title-based fallback IDs where they can be identified.
         # No private runtime database is rewritten outside the normal Store migration.
         for row in self.rows(

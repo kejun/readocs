@@ -18,7 +18,7 @@ from .content import canonical, digest
 from .errors import Problem
 from .feishu import Feishu
 from .network import Network, validate_url
-from .store import Store
+from .store import FEISHU_INTERVAL, Store
 from .worker import Worker
 
 STATIC = Path(__file__).parent / "static"
@@ -322,13 +322,13 @@ def create_app(directory=None, network=None, background=True, device_prefix=""):
                 store.db.execute("DELETE FROM settings WHERE key='feishu_user'")
             store.db.execute(
                 "INSERT INTO sources(id,kind,title,config,interval,generation) VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(id) DO UPDATE SET title=excluded.title,config=excluded.config,generation=excluded.generation,due=0,error=NULL",
+                "ON CONFLICT(id) DO UPDATE SET title=excluded.title,config=excluded.config,interval=excluded.interval,generation=excluded.generation,due=0,error=NULL",
                 (
                     sid,
                     "feishu",
                     "飞书文档",
                     store.encrypt({"scope": "all"}),
-                    300,
+                    FEISHU_INTERVAL,
                     generation,
                 ),
             )
