@@ -38,7 +38,6 @@ def test_actual_reader_keeps_fast_partial_refresh(tmp_path):
     for marker in (
         "static const char *epd_mode_name(",
         "static void font(",
-        "static uint32_t codepoint(",
         "static void begin(",
         "static void finish(",
         "static void finish_partial(",

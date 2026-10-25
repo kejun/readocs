@@ -9,22 +9,10 @@
 #include <string>
 #include <vector>
 
-static size_t font_metric_calls = 0, yields = 0;
-namespace lgfx { inline namespace v1 {
-#include "font_under_test.hpp"
-size_t U8g2font::drawChar(LGFXBase *, int32_t, int32_t, uint16_t,
-                         const TextStyle *, FontMetrics *, int32_t &) const { return 0; }
-}}
-extern "C" {
-extern const uint8_t lgfx_efont_cn_16[], lgfx_efont_cn_24[], lgfx_efont_cn_24_b[];
-}
-namespace fonts {
-static const lgfx::U8g2font efontCN_16{lgfx_efont_cn_16};
-static const lgfx::U8g2font efontCN_24{lgfx_efont_cn_24};
-static const lgfx::U8g2font efontCN_24_b{lgfx_efont_cn_24_b};
-}
+static size_t yields = 0;
+#include "font_test_support.hpp"
 struct Display {
-  const lgfx::IFont *font = &fonts::efontCN_24;
+  const lgfx::IFont *font = rd::reader_font(24, false);
   lgfx::TextStyle _text_style;
   enum utf8_decode_state_t : uint8_t { utf8_state0, utf8_state1, utf8_state2, utf8_state3 };
   utf8_decode_state_t _decoderState = utf8_decode_state_t::utf8_state0;
@@ -32,7 +20,7 @@ struct Display {
   bool _emoji_draw_cb = false;
   void setFont(const lgfx::IFont *value) { font = value; }
   const lgfx::IFont *getFont() const { return font; }
-  void setTextSize(float value) { _text_style.size_x = value; }
+  void setTextSize(float value) { _text_style.size_x = _text_style.size_y = value; }
   int textWidth(const char *text) {
     lgfx::FontMetrics metrics{};
     font->getDefaultMetric(&metrics);
@@ -53,6 +41,7 @@ template <typename... Args> static void log_message(Args...) {}
 #define ESP_LOGW(...) log_message(__VA_ARGS__)
 
 namespace rd {
+int text_width(const std::string &s) { return M5.Display.textWidth(display_text(s).c_str()); }
 struct JsonDelete { void operator()(cJSON *j) const { cJSON_Delete(j); } };
 using Json = std::unique_ptr<cJSON, JsonDelete>;
 static std::string str(cJSON *j, const char *key) {
@@ -96,6 +85,8 @@ static void compare(int size, bool require_speedup) {
 }
 int main(int argc, char **argv) {
   using namespace rd;
+  assert(argc >= 2);
+  load_test_fonts(argv[1]);
   Json doc(cJSON_CreateObject());
   auto *blocks = cJSON_AddArrayToObject(doc.get(), "blocks");
   const std::string mixed = "文章更新中文测试，English ffi jW 0123!? e\u0301 ❤\ufe0f 👩‍💻\t\r\n";
@@ -112,8 +103,8 @@ int main(int argc, char **argv) {
   document = serialized;
   cJSON_free(serialized);
   for (const int size : {16, 24, 32}) compare(size, true);
-  if (argc > 1) {
-    std::ifstream input(argv[1]);
+  if (argc > 2) {
+    std::ifstream input(argv[2]);
     document.assign(std::istreambuf_iterator<char>(input), {});
     assert(document.size() > 60000);
     for (const int size : {16, 24, 32}) compare(size, true);

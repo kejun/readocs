@@ -3,6 +3,7 @@
 #include "readocs.hpp"
 #include "source_metadata.hpp"
 #include "ui_power_policy.hpp"
+#include "reader_fonts.hpp"
 #include <algorithm>
 #include <cstring>
 #include <ctime>
@@ -938,7 +939,11 @@ void init_network() {
 }
 static void status_console() {
   Json j(cJSON_CreateObject());
-  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.4");
+  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.5");
+  cJSON_AddStringToObject(j.get(), "font_family", "Noto Sans SC");
+  cJSON_AddBoolToObject(j.get(), "fonts_ready", reader_fonts_ready());
+  cJSON_AddNumberToObject(j.get(), "font_revision", font_asset_revision);
+  cJSON_AddNumberToObject(j.get(), "emoji_sequences", emoji_sequence_count);
   cJSON_AddBoolToObject(j.get(), "connected", connected.load());
   cJSON_AddBoolToObject(j.get(), "busy", networking.load());
   cJSON_AddNumberToObject(j.get(), "uptime_ms", now_ms());
@@ -951,6 +956,7 @@ static void status_console() {
   {
     std::lock_guard<std::mutex> g(model.mutex);
     cJSON_AddStringToObject(j.get(), "status", model.status.c_str());
+    cJSON_AddNumberToObject(j.get(), "font_size", model.config.font_size);
     cJSON_AddStringToObject(j.get(), "ip", model.ip.c_str());
     cJSON_AddStringToObject(j.get(), "ssid", model.ssid.c_str());
     cJSON_AddBoolToObject(j.get(), "paired", !model.config.token.empty());

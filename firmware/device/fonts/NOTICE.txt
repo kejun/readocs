@@ -1,0 +1,19 @@
+Readocs native bitmap font resources
+
+noto_sc_16.bff, noto_sc_24.bff and noto_sc_32.bff are converted subsets of
+Noto Sans SC Regular.
+Original font copyright notice: © 2014-2021 Adobe (http://www.adobe.com/).
+Licensed under the SIL Open Font License 1.1; see NotoSans-OFL.txt.
+
+noto_emoji_16.bff, noto_emoji_24.bff and noto_emoji_32.bff are converted
+monochrome subsets of Noto Emoji, with internal codepoint remapping for
+whole Emoji sequences.
+Original font copyright notice: Copyright 2013 Google LLC
+Licensed under the SIL Open Font License 1.1; see NotoEmoji-OFL.txt.
+
+emoji.emap is generated using Unicode Emoji 17.0 data.
+The Unicode data license is provided in Unicode-LICENSE.txt.
+
+Pinned source URLs, checksums and conversion tool versions are recorded in
+sources.lock.json and manifest.json. The converted resources are not
+unmodified upstream font files.

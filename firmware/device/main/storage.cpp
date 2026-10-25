@@ -260,6 +260,7 @@ bool load_storage() {
     position.snapshot = str(pos.get(), "snapshot");
     position.offset = num(pos.get(), "offset");
     position.page = num(pos.get(), "page");
+    position.font_revision = num(pos.get(), "font_revision");
   }
   return true;
 }
@@ -331,6 +332,7 @@ void save_position(const Position &p) {
   cJSON_AddStringToObject(j.get(), "snapshot", p.snapshot.c_str());
   cJSON_AddNumberToObject(j.get(), "offset", p.offset);
   cJSON_AddNumberToObject(j.get(), "page", p.page);
+  cJSON_AddNumberToObject(j.get(), "font_revision", p.font_revision);
   auto s = serialize(j.get());
   Json all(cJSON_Parse(get_positions().c_str()));
   if (!all)
@@ -360,7 +362,8 @@ Position load_position(const std::string &doc) {
   if (!cJSON_IsObject(p))
     return {};
   return {str(p, "document"), str(p, "block"), str(p, "snapshot"),
-          static_cast<unsigned>(num(p, "offset")), num(p, "page")};
+          static_cast<unsigned>(num(p, "offset")), num(p, "page"),
+          static_cast<uint32_t>(num(p, "font_revision"))};
 }
 static bool mark_cache_links(const std::string &id, bool progress,
                               std::set<std::string> &keep) {

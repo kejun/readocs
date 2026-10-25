@@ -108,6 +108,7 @@ struct Position {
   std::string document, block, snapshot;
   unsigned offset = 0;
   int page = 0;
+  uint32_t font_revision = 0;
 };
 extern Position position;
 int64_t now_ms();

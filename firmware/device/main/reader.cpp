@@ -1,5 +1,6 @@
 #include "readocs.hpp"
 #include "layout_width.hpp"
+#include "reader_fonts.hpp"
 #include <algorithm>
 #include <cctype>
 #include <esp_log.h>
@@ -38,6 +39,7 @@ static bool page_valid = false;
 static std::string page_source, page_document, page_snapshot, page_title;
 static std::string metadata_snapshot, content_timestamp;
 static unsigned page_font_size = 0;
+static uint32_t page_font_revision = 0;
 static int page_index = -1, page_count = 0;
 
 static void invalidate_navigation() {
@@ -104,26 +106,8 @@ static bool jpeg_size(const uint8_t *data, size_t len, int &width, int &height) 
   return false;
 }
 static void font(int size, bool heading = false) {
-  M5.Display.setFont(
-      heading ? &fonts::efontCN_24_b
-              : (size == 16 ? &fonts::efontCN_16 : &fonts::efontCN_24));
-  M5.Display.setTextSize(size == 32 ? 32.0f / 24.0f : 1.0f);
-}
-static uint32_t codepoint(const std::string &s, size_t &at) {
-  auto c = static_cast<uint8_t>(s[at++]);
-  if (c < 128)
-    return c;
-  int n = c < 0xe0 ? 1 : c < 0xf0 ? 2 : 3;
-  uint32_t value = c & ((1U << (6 - n)) - 1);
-  while (n-- && at < s.size())
-    value = (value << 6) | (static_cast<uint8_t>(s[at++]) & 63);
-  return value;
-}
-static bool extends(uint32_t cp) {
-  return (cp >= 0x300 && cp <= 0x36f) || (cp >= 0x1ab0 && cp <= 0x1aff) ||
-         (cp >= 0x1dc0 && cp <= 0x1dff) || (cp >= 0xfe00 && cp <= 0xfe0f) ||
-         (cp >= 0xfe20 && cp <= 0xfe2f) || (cp >= 0x1f3fb && cp <= 0x1f3ff) ||
-         (cp >= 0xe0100 && cp <= 0xe01ef);
+  M5.Display.setFont(reader_font(size, heading));
+  M5.Display.setTextSize(1.0f);
 }
 std::vector<Page> layout(const std::string &snapshot, int size) {
   const int64_t started = esp_timer_get_time();
@@ -172,7 +156,7 @@ std::vector<Page> layout(const std::string &snapshot, int size) {
       line = "│ ";
     font(size, heading);
     const auto *active_font = M5.Display.getFont();
-    const int scale = 65536 * (size == 32 ? 32.0f / 24.0f : 1.0f);
+    const int scale = 65536;
     auto measure = [&](uint32_t cp) {
       lgfx::FontMetrics metrics{};
       active_font->getDefaultMetric(&metrics);
@@ -185,32 +169,23 @@ std::vector<Page> layout(const std::string &snapshot, int size) {
     };
     auto append_width = [&](LineExtent &width, const std::string &part) {
       for (size_t at = 0; at < part.size();) {
-        const auto cp = codepoint(part, at);
+        const auto cp = text_codepoint(part, at);
         if (cp < 0x20 || (cp >= 0xfe00 && cp < 0xfe10))
           continue;
         width.append(glyphs[heading].get(cp, measure));
       }
     };
     LineExtent line_width;
-    append_width(line_width, line);
+    append_width(line_width, display_text(line));
     for (size_t i = 0; i < text.size();) {
       // Long documents must let the idle task run during font measurement.
       if ((offset & 63) == 0)
         vTaskDelay(1);
-      size_t start = i;
-      uint32_t cp = codepoint(text, i);
-      unsigned cluster_count = 1;
-      bool joined = false;
-      while (i < text.size()) {
-        size_t look = i;
-        uint32_t next = codepoint(text, look);
-        if (extends(next) || next == 0x200d || joined) {
-          i = look;
-          ++cluster_count;
-          joined = next == 0x200d;
-        } else
-          break;
-      }
+      const auto group = next_text_cluster(text, i, reader_emoji_map());
+      const auto start = group.start;
+      auto cp_at = start;
+      const auto cp = text_codepoint(text, cp_at);
+      const auto cluster_count = group.codepoints;
       if (cp == '\r')
         continue;
       if (cp == '\n') {
@@ -223,13 +198,13 @@ std::vector<Page> layout(const std::string &snapshot, int size) {
       }
       auto cluster = text.substr(start, i - start);
       auto next_width = line_width;
-      append_width(next_width, cluster);
+      append_width(next_width, shape_cluster(text, group));
       if (!line.empty() && next_width.width() > 476 - indent) {
         add(std::string(indent / 8, ' ') + line, heading, bid, line_start);
         line.clear();
         line_start = offset;
         next_width = {};
-        append_width(next_width, cluster);
+        append_width(next_width, shape_cluster(text, group));
       }
       line_width = next_width;
       line += cluster;
@@ -310,6 +285,7 @@ void draw_page(const Entry &e, const std::vector<Page> &pages, int index) {
   const bool same_layout =
       page_valid && page_source == e.source_id && page_document == e.document_id &&
       page_snapshot == e.snapshot_id && page_font_size == size &&
+      page_font_revision == font_asset_revision &&
       page_title == e.title && page_count == static_cast<int>(pages.size());
   if (same_layout && page_index == index && !quality_cleanup_due())
     return;
@@ -329,24 +305,21 @@ void draw_page(const Entry &e, const std::vector<Page> &pages, int index) {
     font(16);
     d.setCursor(32, 25);
     std::string title = e.title;
-    while (!title.empty() && d.textWidth(title.c_str()) > 475) {
-      size_t i = title.size() - 1;
-      while (i > 0 && (static_cast<unsigned char>(title[i]) & 0xc0) == 0x80)
-        --i;
-      title.resize(i);
+    while (!title.empty() && text_width(title.c_str()) > 475) {
+      title.resize(last_text_cluster(title, reader_emoji_map()));
     }
-    d.print(title.c_str());
+    print_text(title.c_str());
     d.drawFastHLine(32, 62, 476, TFT_BLACK);
   }
   font(size);
   for (const auto &line : pages[index].lines) {
     font(size, line.heading);
     d.setCursor(32, line.y);
-    d.print(line.text.c_str());
+    print_text(line.text.c_str());
   }
   font(16);
   d.setCursor(32, 896);
-  d.print("A 下一页   B 上一页   按住 B 列表");
+  print_text("A 下一页   B 上一页   按住 B 列表");
   d.setCursor(32, 922);
   d.printf("%d / %u", index + 1, static_cast<unsigned>(pages.size()));
   if (metadata_snapshot != e.snapshot_id) {
@@ -356,7 +329,7 @@ void draw_page(const Entry &e, const std::vector<Page> &pages, int index) {
   }
   if (!content_timestamp.empty()) {
     d.setCursor(245, 922);
-    d.print(content_timestamp.substr(0, 19).c_str());
+    print_text(content_timestamp.substr(0, 19).c_str());
   }
   if (partial)
     finish_partial(0, 63, d.width(), d.height() - 63);
@@ -368,6 +341,7 @@ void draw_page(const Entry &e, const std::vector<Page> &pages, int index) {
   page_snapshot = e.snapshot_id;
   page_title = e.title;
   page_font_size = size;
+  page_font_revision = font_asset_revision;
   page_index = index;
   page_count = static_cast<int>(pages.size());
   {
@@ -375,27 +349,22 @@ void draw_page(const Entry &e, const std::vector<Page> &pages, int index) {
     model.page = index;
   }
   position = {e.document_id, pages[index].block, e.snapshot_id,
-              pages[index].offset, index};
+              pages[index].offset, index, font_asset_revision};
   save_position(position);
 }
 static std::vector<std::string> article_title(const std::string &title) {
   std::vector<std::string> lines(1);
-  auto &d = M5.Display;
   for (size_t at = 0; at < title.size();) {
     size_t start = at;
-    codepoint(title, at);
+    next_text_cluster(title, at, reader_emoji_map());
     auto cluster = title.substr(start, at - start);
     if (cluster == "\n" || cluster == "\r")
       cluster = " ";
-    if (d.textWidth((lines.back() + cluster).c_str()) > 450) {
+    if (text_width((lines.back() + cluster).c_str()) > 450) {
       if (lines.size() == 2) {
         while (!lines.back().empty() &&
-               d.textWidth((lines.back() + "…").c_str()) > 450) {
-          size_t end = lines.back().size() - 1;
-          while (end > 0 &&
-                 (static_cast<unsigned char>(lines.back()[end]) & 0xc0) == 0x80)
-            --end;
-          lines.back().resize(end);
+               text_width((lines.back() + "…").c_str()) > 450) {
+          lines.back().resize(last_text_cluster(lines.back(), reader_emoji_map()));
         }
         lines.back() += "…";
         break;
@@ -445,12 +414,12 @@ static void draw_article_row(const std::vector<Entry> &entries, int selected,
   auto lines = article_title(entries[index].title);
   for (size_t n = 0; n < lines.size(); ++n) {
     d.setCursor(40, y + n * 30);
-    d.print(lines[n].c_str());
+    print_text(lines[n].c_str());
   }
   if (entries[index].snapshot_id.empty()) {
     font(16);
     d.setCursor(444, y + 58);
-    d.print("未下载");
+    print_text("未下载");
   }
   d.setTextColor(TFT_BLACK, TFT_WHITE);
 }
@@ -464,25 +433,19 @@ static void draw_menu_row(const std::vector<std::string> &options, int selected,
                  active ? TFT_BLACK : TFT_WHITE);
   font(24);
   std::string name = options[index];
-  while (!name.empty() && d.textWidth(name.c_str()) > 450) {
-    size_t n = name.size() - 1;
-    while (n > 0 && (static_cast<unsigned char>(name[n]) & 0xc0) == 0x80)
-      --n;
-    name.resize(n);
+  while (!name.empty() && text_width(name.c_str()) > 450) {
+    name.resize(last_text_cluster(name, reader_emoji_map()));
   }
   d.setCursor(40, y);
-  d.print(name.c_str());
+  print_text(name.c_str());
   d.setTextColor(TFT_BLACK, TFT_WHITE);
 }
 
 static std::string fit_header(std::string title) {
-  if (M5.Display.textWidth(title.c_str()) <= 330)
+  if (text_width(title.c_str()) <= 330)
     return title;
-  while (!title.empty() && M5.Display.textWidth((title + "…").c_str()) > 330) {
-    size_t end = title.size() - 1;
-    while (end > 0 && (static_cast<unsigned char>(title[end]) & 0xc0) == 0x80)
-      --end;
-    title.resize(end);
+  while (!title.empty() && text_width((title + "…").c_str()) > 330) {
+    title.resize(last_text_cluster(title, reader_emoji_map()));
   }
   return title + "…";
 }
@@ -498,12 +461,12 @@ static void draw_source_row(const std::vector<Source> &sources, int selected,
   const auto lines = article_title(sources[index].title);
   for (size_t n = 0; n < lines.size(); ++n) {
     d.setCursor(40, y + n * 30);
-    d.print(lines[n].c_str());
+    print_text(lines[n].c_str());
   }
   font(16);
   const auto count = std::to_string(sources[index].count) + " 篇";
-  d.setCursor(496 - d.textWidth(count.c_str()), y + 58);
-  d.print(count.c_str());
+  d.setCursor(496 - text_width(count.c_str()), y + 58);
+  print_text(count.c_str());
   d.setTextColor(TFT_BLACK, TFT_WHITE);
 }
 
@@ -535,21 +498,21 @@ void draw_sources(const std::vector<Source> &sources, int selected) {
   begin();
   font(24, true);
   d.setCursor(32, 36);
-  d.print("内容来源");
+  print_text("内容来源");
   d.drawFastHLine(32, 86, 476, TFT_BLACK);
   if (sources.empty()) {
     font(24);
     d.setCursor(32, 160);
-    d.print("暂无内容来源");
+    print_text("暂无内容来源");
   } else
     for (int i = start;
          i < std::min(start + article_page_size, static_cast<int>(sources.size())); ++i)
       draw_source_row(sources, selected, i, 120 + (i - start) * 88);
   font(16);
   d.setCursor(32, 880);
-  d.print("A 下一来源    A+B 上一来源    B 进入");
+  print_text("A 下一来源    A+B 上一来源    B 进入");
   d.setCursor(32, 922);
-  d.print("按住 A 检查更新    按住 B 菜单");
+  print_text("按住 A 检查更新    按住 B 菜单");
   finish();
   sources_valid = true;
   sources_signature = signature;
@@ -588,20 +551,20 @@ void draw_articles(const std::vector<Entry> &entries, int selected,
   begin();
   font(24, true);
   d.setCursor(32, 36);
-  d.print(fit_header(source_title).c_str());
+  print_text(fit_header(source_title).c_str());
   d.drawFastHLine(32, 86, 476, TFT_BLACK);
   if (entries.empty()) {
     font(24);
     d.setCursor(32, 160);
-    d.print(source_count > 0 ? "目录同步中" : "暂无文章");
+    print_text(source_count > 0 ? "目录同步中" : "暂无文章");
   } else {
     const int end =
         std::min(start + article_page_size, static_cast<int>(entries.size()));
     font(16);
     const auto counter = std::to_string(start + 1) + "–" + std::to_string(end) +
                          " / " + std::to_string(entries.size());
-    d.setCursor(508 - d.textWidth(counter.c_str()), 43);
-    d.print(counter.c_str());
+    d.setCursor(508 - text_width(counter.c_str()), 43);
+    print_text(counter.c_str());
     for (int i = start; i < end; ++i)
       draw_article_row(entries, selected, i, 120 + (i - start) * 88);
   }
@@ -609,12 +572,12 @@ void draw_articles(const std::vector<Entry> &entries, int selected,
   font(16);
   if (!entries.empty()) {
     d.setCursor(32, 880);
-    d.print("A 下一项    A+B 上一项    B 打开");
+    print_text("A 下一项    A+B 上一项    B 打开");
     d.setCursor(32, 922);
-    d.print("按住 A 翻页    按住 B 返回来源");
+    print_text("按住 A 翻页    按住 B 返回来源");
   } else {
     d.setCursor(32, 922);
-    d.print("按住 B 返回来源");
+    print_text("按住 B 返回来源");
   }
   finish();
   articles_valid = true;
@@ -648,7 +611,7 @@ void draw_menu(const std::vector<std::string> &options, int selected,
   begin();
   font(24, true);
   d.setCursor(32, 36);
-  d.print(title.c_str());
+  print_text(title.c_str());
   d.drawFastHLine(32, 86, 476, TFT_BLACK);
   for (int i = start;
        i < std::min(start + 10, static_cast<int>(options.size())); ++i)
@@ -656,7 +619,7 @@ void draw_menu(const std::vector<std::string> &options, int selected,
   d.setTextColor(TFT_BLACK, TFT_WHITE);
   font(16);
   d.setCursor(32, 922);
-  d.print("A 下一项    B 确认    按住 B 返回");
+  print_text("A 下一项    B 确认    按住 B 返回");
   finish();
   menu_valid = true;
   menu_signature = signature;
@@ -669,12 +632,12 @@ void draw_message(const std::string &title,
   auto &d = M5.Display;
   font(24, true);
   d.setCursor(32, 50);
-  d.print(title.c_str());
+  print_text(title.c_str());
   font(size);
   int y = 160;
   for (const auto &line : lines) {
     d.setCursor(32, y);
-    d.println(line.c_str());
+    print_text(line);
     y += 60;
   }
   finish();
@@ -725,21 +688,19 @@ static void draw_probe(int x, int y, int w, int h, int mode, int iteration) {
   d.setTextColor(TFT_BLACK, TFT_WHITE);
   d.setTextDatum(m5gfx::textdatum_t::top_left);
   d.setTextWrap(false);
-  d.setFont(&fonts::efontCN_24);
-  d.setTextSize(1.0f);
+  font(24);
   d.setClipRect(x, y, w, h);
   const int block_y = y + h - 64;
   int line = 0;
   for (int yy = y + 8; yy + 32 <= block_y; yy += 32, ++line) {
     d.setCursor(x + 8, yy);
-    d.printf("%s %d  ABC abc 0123456789 春日有信", epd_mode_name(mode),
-             line + 1);
+    print_text(std::string(epd_mode_name(mode)) + " 中文 ABC 😀❤️👩‍💻🇨🇳");
   }
   const int bx = x + 8 + (iteration * 53) % std::max(1, w - 96);
   d.fillRect(bx, block_y, 80, 56, TFT_BLACK);
   d.setTextColor(TFT_WHITE, TFT_BLACK);
   d.setCursor(bx + 6, block_y + 14);
-  d.print("AB");
+  print_text("AB");
   d.clearClipRect();
 }
 

@@ -108,7 +108,7 @@ USB 恢复入口：
 
 硬件固定为 PaperDIY / ESP32-S3、16 MiB Flash、8 MiB Octal PSRAM，使用硬件诊断验证过的 M5Unified / M5GFX 版本。
 
-当前字体、中文字体候选、Emoji 方案及字库体积实测见[终端中文字体与 Emoji 调研](docs/font-research.md)。
+0.2.5 使用 Noto Sans SC 与独立 Noto Emoji 黑白字库，提供原生 16 / 24 / 32 像素字号，保留快速局刷与电池轻睡。资源、覆盖范围和可复现构建见[字库说明](firmware/device/fonts/README.md)，选型依据见[字体调研](docs/font-research.md)。菜单「字号」可预览中文和 Emoji。
 
 ```sh
 python3 firmware/device/fetch_components.py

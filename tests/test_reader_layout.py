@@ -1,10 +1,10 @@
 import os
-import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+from test_fonts import FONTS, prepare_font_test
 
 
 def function(source, marker):
@@ -25,27 +25,7 @@ def test_actual_layout_matches_m5gfx_font_metrics(tmp_path):
     compiler = shutil.which("clang++") or shutil.which("g++")
     c_compiler = shutil.which("clang") or shutil.which("gcc")
     assert compiler and c_compiler
-    fonts = (gfx / "v1/lgfx_fonts.cpp").read_text()
-    font_impl = fonts.split("  struct u8g2_font_decode_t", 1)[1].split(
-        "  size_t U8g2font::drawChar", 1
-    )[0]
-    font_impl = "  struct u8g2_font_decode_t" + font_impl
-    font_impl = font_impl.replace(
-        "bool U8g2font::updateFontMetric(lgfx::FontMetrics *metrics, uint16_t uniCode) const\n  {",
-        "bool U8g2font::updateFontMetric(lgfx::FontMetrics *metrics, uint16_t uniCode) const\n  {\n    ++font_metric_calls;",
-    )
-    (tmp_path / "font_under_test.hpp").write_text(font_impl)
-    data = (gfx / "Fonts/efont/lgfx_efont_cn.c").read_text()
-    arrays = []
-    for name in ("16", "24", "24_b"):
-        match = re.search(
-            rf"PROGMEM const uint8_t lgfx_efont_cn_{name}\[\d+\] =.*?;\n",
-            data,
-            re.DOTALL,
-        )
-        assert match
-        arrays.append(match.group().replace("PROGMEM ", ""))
-    (tmp_path / "font_data.c").write_text("#include <stdint.h>\n" + "\n".join(arrays))
+    prepare_font_test(tmp_path)
     lgfx = (gfx / "v1/LGFXBase.cpp").read_text()
     width = function(lgfx, "int32_t LGFXBase::text_width(").replace(
         "LGFXBase::text_width(", "text_width("
@@ -61,13 +41,13 @@ def test_actual_layout_matches_m5gfx_font_metrics(tmp_path):
     layout = function(reader, "std::vector<Page> layout(")
     reference = layout.replace("layout(", "layout_reference(", 1).replace(
         "next_width.width() > 476 - indent",
-        "M5.Display.textWidth((line + cluster).c_str()) > 476 - indent",
+        "text_width(line + cluster) > 476 - indent",
     )
     (tmp_path / "layout_under_test.hpp").write_text(
         "static void font(" + helpers + layout + reference
     )
     objects = []
-    for source in (cjson / "cJSON.c", tmp_path / "font_data.c"):
+    for source in (cjson / "cJSON.c",):
         obj = tmp_path / (source.stem + ".o")
         subprocess.run(
             [c_compiler, "-std=c99", "-c", str(source), "-o", str(obj)], check=True
@@ -84,8 +64,12 @@ def test_actual_layout_matches_m5gfx_font_metrics(tmp_path):
             "-Werror",
             "-I",
             str(main),
-            "-I",
+            "-isystem",
             str(gfx / "v1"),
+            "-isystem",
+            str(gfx.parent),
+            "-I",
+            str(root / "tests"),
             "-I",
             str(cjson),
             "-I",
@@ -98,4 +82,6 @@ def test_actual_layout_matches_m5gfx_font_metrics(tmp_path):
         check=True,
     )
     fixture = os.environ.get("READOCS_LAYOUT_FIXTURE")
-    subprocess.run([str(binary), *([fixture] if fixture else [])], check=True)
+    subprocess.run(
+        [str(binary), str(FONTS), *([fixture] if fixture else [])], check=True
+    )

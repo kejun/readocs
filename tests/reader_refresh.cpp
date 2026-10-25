@@ -1,4 +1,6 @@
 #include "article_list.hpp"
+#include "text_clusters.hpp"
+#include "../firmware/device/fonts/revision.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -16,7 +18,8 @@ namespace m5gfx {
 enum class epd_mode_t { epd_quality = 1, epd_text = 2, epd_fast = 3 };
 namespace textdatum_t { constexpr int top_left = 0; }
 }
-namespace fonts { static int efontCN_16, efontCN_24, efontCN_24_b; }
+static const int native_font = 0;
+static const int *reader_font(int, bool) { return &native_font; }
 static constexpr int TFT_WHITE = 255, TFT_BLACK = 0;
 struct Rect { int x, y, w, h; };
 static bool same(Rect a, Rect b) {
@@ -69,6 +72,11 @@ struct Display {
   void waitDisplay() { clock_us += 1000; }
 };
 static struct { Display Display; } M5;
+static rd::EmojiMap test_emoji;
+static const rd::EmojiMap &reader_emoji_map() { return test_emoji; }
+static std::string display_text(const std::string &s) { return rd::shape_text(s, test_emoji); }
+static int text_width(const std::string &s) { return M5.Display.textWidth(display_text(s).c_str()); }
+static void print_text(const std::string &s) { M5.Display.print(display_text(s).c_str()); }
 static struct { std::mutex mutex; struct { unsigned font_size=24; } config; int page=0; } model;
 static Position position;
 static int reads=0, saves=0;

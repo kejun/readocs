@@ -1,4 +1,5 @@
 #include "readocs.hpp"
+#include "reader_fonts.hpp"
 #include "ui_power_policy.hpp"
 #include <algorithm>
 #include <ctime>
@@ -22,6 +23,7 @@ std::atomic<bool> connected{false}, networking{false}, redraw{true},
 std::atomic<int64_t> last_input{0}, ap_activity{0};
 QueueHandle_t actions, buttons;
 static RTC_DATA_ATTR int retained_page = 0;
+static RTC_DATA_ATTR uint32_t retained_font_revision = 0;
 static RTC_DATA_ATTR char retained_document[129]{};
 static RTC_DATA_ATTR int retained_view = static_cast<int>(View::Sources);
 static RTC_DATA_ATTR int retained_selected = 0;
@@ -135,6 +137,10 @@ extern "C" void app_main() {
     return;
   }
   M5.Display.setAutoDisplay(false);
+  if (!init_reader_fonts()) {
+    ESP_LOGE("readocs", "Font initialization failed; application image needs repair");
+    return;
+  }
   M5.Display.setEpdMode(m5gfx::epd_mode_t::epd_quality);
   ESP_LOGI("readocs", "reset reason=%d", static_cast<int>(esp_reset_reason()));
   configure_power_key();
@@ -249,12 +255,14 @@ extern "C" void app_main() {
           anchored = i;
       if (anchored >= 0)
         page = anchored;
-      else if (position.snapshot == e.snapshot_id && !reflow)
+      else if (position.snapshot == e.snapshot_id && !reflow &&
+               position.font_revision == font_asset_revision)
         page = position.page;
     }
     if (std::string(retained_document) == e.document_id &&
         std::string(retained_current_source) == e.source_id &&
         wake != ESP_SLEEP_WAKEUP_UNDEFINED &&
+        retained_font_revision == font_asset_revision &&
         position.snapshot == e.snapshot_id && !reflow)
       page = retained_page;
     page = std::clamp(page, 0, std::max(0, static_cast<int>(pages.size()) - 1));
@@ -549,7 +557,8 @@ extern "C" void app_main() {
       else if (view == View::Fonts)
         draw_message(
             "字号",
-            {"春日有信，阅读有时。", "AaBbCc 0123456789", "A 切换    B 使用"},
+            {"春日有信，阅读有时。", "AaBbCc 0123456789",
+             "😀 ❤️ 👍🏽 👩‍💻 🇨🇳", "A 切换    B 使用"},
             selected == 0   ? 16
             : selected == 1 ? 24
                             : 32);
@@ -605,6 +614,7 @@ extern "C" void app_main() {
     browser.retain(retained_source_selections, retained_source_count);
     if (!current.document_id.empty() && !pages.empty()) {
       retained_page = page;
+      retained_font_revision = font_asset_revision;
       std::snprintf(retained_document, sizeof(retained_document), "%s",
                     current.document_id.c_str());
       std::snprintf(retained_current_source, sizeof(retained_current_source), "%s",
