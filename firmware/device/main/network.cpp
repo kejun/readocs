@@ -26,6 +26,7 @@
 #include <freertos/event_groups.h>
 #include <lwip/sockets.h>
 #include <sys/socket.h>
+#include "setup_access.hpp"
 #include <utility>
 
 namespace rd {
@@ -885,29 +886,52 @@ void start_setup() {
 }
 static const char PAGE[] =
     R"HTML(<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Readocs · Wi-Fi</title><style>*{box-sizing:border-box}body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:#1c252c;background:#f7f8fa;max-width:440px;padding:32px 24px;margin:20px auto}h1{font-size:28px;margin:40px 0 30px}label{display:block;font-size:14px;margin-top:22px}input,button{font:inherit;width:100%;padding:12px;border:1px solid #d3dde1;border-radius:7px;background:white;margin-top:8px}button{cursor:pointer}button[type=submit]{background:#17766b;color:white;border:0;margin-top:30px}#networks button{text-align:left;background:none;border:0;border-bottom:1px solid #e0e6e9;border-radius:0}details{font-size:13px;margin-top:28px;color:#69777e}#result{font-size:14px}header{font-weight:650;font-size:22px}</style><header>readocs</header><h1>连接 Wi-Fi</h1><div id="networks"></div><button id="scan">扫描网络</button><form id="form"><label for="ssid">Wi-Fi 名称</label><input id="ssid" maxlength="32" required><label for="password">密码</label><input id="password" type="password" maxlength="63" autocomplete="new-password"><div id="replace"></div><button type="submit">连接</button><p id="result" role="status"></p></form><details><summary>已保存的网络</summary><div id="saved"></div></details><details><summary>网络要求</summary><p>使用 2.4 GHz 个人 Wi-Fi 或手机热点。换网络后，阅读内容和飞书配置会保留。</p></details><script>let session='',profiles=[];const $=s=>document.querySelector(s);async function call(path,data){const r=await fetch(path,{method:data?'POST':'GET',headers:data?{'Content-Type':'application/json','X-Setup-Session':session}:{},body:data?JSON.stringify(data):undefined});const j=await r.json();if(!r.ok)throw Error(j.message||'操作失败');return j}async function load(){let s=await call('/api/status');session=s.session;profiles=s.networks;$('#saved').replaceChildren();profiles.forEach(n=>{let b=document.createElement('button');b.type='button';b.textContent=n; b.onclick=async()=>{if(confirm('忘记 '+n+'？')){try{await call('/api/forget',{ssid:n});await load()}catch(e){$('#result').textContent=e.message}}};$('#saved').append(b)})}$('#scan').onclick=async()=>{try{$('#scan').disabled=true;const list=await call('/api/scan');$('#networks').replaceChildren();list.networks.forEach(n=>{let b=document.createElement('button');b.type='button';b.textContent=n.ssid+(n.secure?' · 加密':'');b.onclick=()=>{$('#ssid').value=n.ssid;$('#password').focus()};$('#networks').append(b)})}catch(e){$('#result').textContent=e.message}finally{$('#scan').disabled=false}};$('#form').onsubmit=async e=>{e.preventDefault();let data={ssid:$('#ssid').value,password:$('#password').value};if(profiles.length>=5&&!profiles.includes(data.ssid)){let choice=prompt('已保存 5 个网络，请输入要替换的网络名称：\n'+profiles.join('\n'));if(!profiles.includes(choice))return;data.replace=choice}try{await call('/api/wifi',data);$('#password').value='';$('#result').textContent='正在连接，请查看设备屏幕。连接成功后热点会关闭。'}catch(err){$('#result').textContent=err.message}};load().catch(e=>$('#result').textContent=e.message);</script></html>)HTML";
-static bool on_ap(httpd_req_t *req) {
-  sockaddr_in local{};
+static bool on_ap(httpd_req_t *req, const char **denial = nullptr) {
+  sockaddr_storage local{};
   socklen_t len = sizeof(local);
   esp_netif_ip_info_t info{};
-  esp_netif_get_ip_info(ap_netif, &info);
-  std::lock_guard<std::mutex> g(model.mutex);
-  return model.ap &&
-         getsockname(httpd_req_to_sockfd(req),
-                     reinterpret_cast<sockaddr *>(&local), &len) == 0 &&
-         local.sin_addr.s_addr == info.ip.addr;
+  const char *code = nullptr;
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    if (!model.ap) code = "setup_closed";
+  }
+  if (!code && (esp_netif_get_ip_info(ap_netif, &info) != ESP_OK || !info.ip.addr))
+    code = "ap_address_unavailable";
+  if (!code && getsockname(httpd_req_to_sockfd(req),
+                          reinterpret_cast<sockaddr *>(&local), &len) != 0)
+    code = "socket_address_unavailable";
+  uint32_t ipv4 = 0;
+  if (!code) code = setup_ipv4(local, len, ipv4);
+  if (!code && ipv4 != info.ip.addr) code = "setup_channel_mismatch";
+  if (denial) *denial = code;
+  if (code)
+    ESP_LOGW("readocs-setup", "denied reason=%s family=%d length=%u ipv6=%d",
+             code, local.ss_family, static_cast<unsigned>(len), CONFIG_LWIP_IPV6);
+  return !code;
 }
 static esp_err_t send_json(httpd_req_t *req, cJSON *j) {
   auto s = serialize(j);
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   return httpd_resp_send(req, s.data(), s.size());
 }
+static esp_err_t setup_error(httpd_req_t *req, const char *status,
+                              const char *code, const char *message) {
+  httpd_resp_set_status(req, status);
+  Json j(cJSON_CreateObject());
+  cJSON_AddStringToObject(j.get(), "code", code);
+  cJSON_AddStringToObject(j.get(), "message", message);
+  return send_json(req, j.get());
+}
 static esp_err_t web(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
   httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
-  if (!on_ap(req))
-    return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
-                               "Use the device setup hotspot");
+  const char *denial = nullptr;
+  if (!on_ap(req, &denial))
+    return setup_error(req, "403 Forbidden", denial,
+        std::strcmp(denial, "setup_closed") == 0
+            ? "配网会话已关闭，请在设备上重新开启配网"
+            : "请重新连接设备屏幕所示热点，再打开 http://192.168.4.1/");
   ap_activity = now_ms();
   if (std::strcmp(req->uri, "/") == 0) {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -997,6 +1021,7 @@ void init_network() {
   ESP_ERROR_CHECK(esp_wifi_start());
   ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
   httpd_handle_t server;
+  ESP_LOGI("readocs-setup", "HTTP IPv6=%d", CONFIG_LWIP_IPV6);
   httpd_config_t sc = HTTPD_DEFAULT_CONFIG();
   sc.stack_size = 8192;
   sc.max_uri_handlers = 6;
