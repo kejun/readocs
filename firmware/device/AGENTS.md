@@ -7,5 +7,6 @@
 - 字体使用原生 16 / 24 / 32 像素的 1 位 Noto Sans SC Medium（500 字重）与独立黑白 Emoji；测宽、绘制和裁剪共用完整序列映射。字体资源修订号须参与分页恢复和旧帧失效，不得复用旧字体页码。修改字体或排版时另运行 `tests/test_fonts.py` 和 `tests/test_reader_layout.py`，使用实际 BFF 解码与资源验证。
 - 电池连续操作窗口使用保留 PSRAM 的轻睡，不要改回每次操作 1 秒后深睡，也不要用 CPU 空转代替。深睡后的首帧仍需完整重建。
 - 保留独立按键采样、波形期间事件积累、释放/队列保护以及 PM1 电源键语义。
+- SD 缓存遵守[存储与同步说明](../../docs/device-storage.md)：禁止自动格式化，保留独立的片内回退指针与文件，GC 只处理本机专用目录。低剩余空间不能仅因低于下载余量就放弃已有离线缓存。不要在按键唤醒或快速绘制路径验证整库正文；文件打开和下载仍需哈希校验。同步改动须运行 `tests/test_sd_sync.py`、`tests/test_sd_storage.py` 及缓存提交、GC、来源和下载回归，保留目标快照与清单版本的接续语义；请求路径和重试改动另运行 `tests/test_firmware_transport.py`，保持 TLS 校验且不自动重放 POST。
 - 修改模式、阈值或等待策略时，同步更新策略文档、实际函数回归和实机记录；区分 USB 注入、物理电池按键、矩形日志、视觉残影和电流测量的证据范围。
 - 运行 `tests/test_reader_refresh.py`、`tests/test_ui_power.py`、`tests/test_input.py`、`tests/test_sleep.py` 及相关回归，构建 ESP-IDF 固件。烧录只更新应用槽，保留用户设置和缓存。

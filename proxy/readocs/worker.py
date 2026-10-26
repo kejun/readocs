@@ -22,9 +22,30 @@ class Worker:
             return
         else:
             request_headers = {}
-            if source["feed_members_known"] and source["upstream_etag"]:
+            # Older releases kept 50 directory entries but only 20 bodies.
+            # A 304 cannot rebuild those missing snapshots. Refetch current
+            # members once; missing historical entries must not disable
+            # conditional checks forever after rolling out of the feed.
+            missing_current_bodies = (
+                self.store.db.execute(
+                    "SELECT 1 FROM documents d JOIN feed_members m "
+                    "ON m.source_id=d.source_id AND m.document_id=d.id "
+                    "WHERE d.source_id=? AND d.snapshot_id IS NULL LIMIT 1",
+                    (sid,),
+                ).fetchone()
+                is not None
+            )
+            if (
+                source["feed_members_known"]
+                and source["upstream_etag"]
+                and not missing_current_bodies
+            ):
                 request_headers["If-None-Match"] = source["upstream_etag"]
-            if source["feed_members_known"] and source["upstream_modified"]:
+            if (
+                source["feed_members_known"]
+                and source["upstream_modified"]
+                and not missing_current_bodies
+            ):
                 request_headers["If-Modified-Since"] = source["upstream_modified"]
             status, headers, body = await self.network.request(
                 "GET", config["url"], headers=request_headers, max_bytes=FEED_MAX_BYTES

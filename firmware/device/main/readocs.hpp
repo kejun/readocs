@@ -38,14 +38,17 @@ struct Profile {
 struct Config {
   std::vector<Profile> networks;
   std::string server, ca, token, device_id;
+  std::string local_server, local_ca, local_name;
   unsigned interval = 3600;
   unsigned font_size = 24;
 };
 struct Entry {
   std::string source_id, document_id, title, snapshot_id;
+  std::string target_snapshot_id{};
   bool operator==(const Entry &other) const {
     return source_id == other.source_id && document_id == other.document_id &&
-           title == other.title && snapshot_id == other.snapshot_id;
+           title == other.title && snapshot_id == other.snapshot_id &&
+           target_snapshot_id == other.target_snapshot_id;
   }
 };
 struct Source {

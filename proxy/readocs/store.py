@@ -361,7 +361,8 @@ class Store:
         return jid
 
     def prune(self, sid):
-        # Directory and body quotas are independent. Disappearance from a feed is not deletion.
+        # Keep full bodies for the complete retained directory, including SD clients.
+        # Disappearance from a feed is not immediate deletion.
         rows = self.rows(
             "SELECT id AS document_id,title,updated AS content_updated_at,seen "
             "FROM documents WHERE source_id=?",
@@ -378,11 +379,6 @@ class Store:
                         (sid, row["document_id"]),
                     )
                 else:
-                    if retained >= 20:
-                        self.db.execute(
-                            "UPDATE documents SET snapshot_id=NULL WHERE source_id=? AND id=?",
-                            (sid, row["document_id"]),
-                        )
                     retained += 1
             self.db.execute(
                 "DELETE FROM feed_fallbacks WHERE source_id=? AND seen<?",

@@ -22,6 +22,8 @@ struct Model {
   bool sync_pending = false;
 } model;
 static std::string error_text;
+static constexpr int index_handle = handle;
+static bool cache_body_verified(const std::string &) { return false; }
 
 static std::string sha256(const std::string &body) {
   std::ostringstream out;

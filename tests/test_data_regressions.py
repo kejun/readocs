@@ -206,8 +206,7 @@ async def test_feed_quotas_use_article_dates_before_xml_order(tmp_path, clock):
     assert [item["title"] for item in items] == [
         f"Article {i}" for i in range(59, 9, -1)
     ]
-    assert all(item["snapshot_id"] for item in items[:20])
-    assert all(item["snapshot_id"] is None for item in items[20:])
+    assert all(item["snapshot_id"] for item in items)
     await worker.fetch(store.source("rss"))
     assert store.catalog("rss") == items
     store.db.close()
@@ -406,4 +405,29 @@ async def test_feishu_directory_timestamp_repairs_immutable_legacy_snapshot(
         store.db.execute("UPDATE feishu_items SET due=0")
     await Library(store, feishu).fetch(store.source("feishu"))
     assert store.catalog("feishu")[0]["snapshot_id"] == new
+    store.db.close()
+
+
+async def test_legacy_rss_body_quota_refetches_then_restores_conditional_checks(
+    tmp_path, clock
+):
+    store = Store(tmp_path)
+    add_source(store)
+    body = feed([{"guid": str(i), "description": str(i)} for i in range(50)])
+    network = FeedNetwork(
+        (200, {"ETag": "stable"}, body), (200, {"ETag": "stable"}, body), (304, {}, b"")
+    )
+    worker = Worker(store, network, None)
+    await worker.fetch(store.source("rss"))
+    with store.db:
+        store.db.execute(
+            "UPDATE documents SET snapshot_id=NULL WHERE id IN (SELECT id FROM documents LIMIT 30)"
+        )
+    await worker.fetch(store.source("rss"))
+    assert len(store.catalog("rss")) == 50
+    assert all(item["snapshot_id"] for item in store.catalog("rss"))
+    assert network.headers[:2] == [{}, {}]
+    await worker.fetch(store.source("rss"))
+    assert network.headers[-1] == {"If-None-Match": "stable"}
+    assert all(item["snapshot_id"] for item in store.catalog("rss"))
     store.db.close()

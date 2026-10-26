@@ -110,6 +110,8 @@ USB 恢复入口：
 
 0.2.6 使用 Noto Sans SC Medium（500 字重）与独立 Noto Emoji 黑白字库，提供原生 16 / 24 / 32 像素字号，保留快速局刷与电池轻睡。资源、覆盖范围和可复现构建见[字库说明](firmware/device/fonts/README.md)，选型依据见[字体调研](docs/font-research.md)。菜单「字号」可预览中文和 Emoji。
 
+0.2.7 支持 SD 扩展缓存：启动后识别可写卡，同步时检查实际剩余空间，空间允许时下载全部已就绪正文，按批次保存进度并自动接续。未装卡或挂载失败时保留片内缓存策略，不会自动格式化卡。容量、回退和校验边界见[SD 存储与同步说明](docs/device-storage.md)。
+
 ```sh
 python3 firmware/device/fetch_components.py
 # 激活 ESP-IDF 5.5.5 环境后：

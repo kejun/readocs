@@ -27,6 +27,10 @@ static Json reference;
 static int failed_chunk, short_chunk, corrupt_chunk, reference_mode;
 static unsigned chunk_requests;
 static bool fail_write, fail_commit, fail_reference;
+static bool sync_made_progress = false, storage_full = false;
+static bool external_cache_enabled() { return false; }
+static bool cache_has_space(uint64_t) { return true; }
+static bool cache_body_verified(const std::string &) { return false; }
 
 static void stage_log(const char *, const char *, const char *stage, int) {
   stages.push_back(stage);
@@ -58,7 +62,7 @@ static std::pair<std::string, std::string> current_article() {
 }
 static void trim_cached_articles(std::vector<Entry> &, const std::string &,
                                  const std::string &, const std::string &,
-                                 const std::string &) {}
+                                 const std::string &, bool) {}
 static bool commit_cache(const std::vector<Entry> &, const std::string &,
                           const std::vector<Source> &) { return !fail_commit; }
 static void collect_cache() {}

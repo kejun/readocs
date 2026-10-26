@@ -1,5 +1,6 @@
 #include "cache_merge.hpp"
 #include "cache_policy.hpp"
+#include "external_storage.hpp"
 #include "readocs.hpp"
 #include "source_metadata.hpp"
 #include "ui_power_policy.hpp"
@@ -34,6 +35,8 @@ static std::atomic<int> reason{0};
 static constexpr EventBits_t GOT_IP = BIT0, LOST_IP = BIT1;
 static int64_t deadline = 0;
 static std::string error_text = "";
+static bool sync_made_progress = false, storage_full = false;
+static std::atomic<bool> local_proxy_failed{false};
 int64_t now_ms() { return esp_timer_get_time() / 1000; }
 void set_status(const std::string &s, bool visible) {
   {
@@ -58,6 +61,7 @@ static std::pair<std::string, std::string> current_article() {
 }
 static void prepare_download_space() {
   collect_cache();
+  if (external_cache_enabled()) return;
   size_t total = 0, used = 0;
   // SPIFFS only guarantees about 75% usable space. Leave room for a body,
   // directory transaction and filesystem GC before retaining older fallbacks.
@@ -119,6 +123,15 @@ static bool ensure_wifi() {
   if (mode == WIFI_MODE_NULL)
     esp_wifi_set_mode(WIFI_MODE_STA);
   esp_wifi_start();
+  // Bulk SD transfers run while networking is active. Avoid modem-sleep
+  // latency; the task still stops Wi-Fi before the ordinary idle/sleep path.
+  if (external_cache_enabled()) {
+    const auto err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) {
+      error_text = "Wi-Fi 传输模式设置失败";
+      return false;
+    }
+  }
   if (connected)
     return true;
   // Choose saved networks actually visible here, so profiles 3–5 remain
@@ -183,7 +196,7 @@ struct Http {
 };
 // Requests in one network action share TLS; release it before stopping Wi-Fi.
 static esp_http_client_handle_t http_client = nullptr;
-static std::string http_server, http_ca;
+static std::string http_server, http_ca, http_name;
 static bool http_retry_used = false;
 static void close_http() {
   if (http_client) {
@@ -193,6 +206,7 @@ static void close_http() {
   }
   http_server.clear();
   http_ca.clear();
+  http_name.clear();
 }
 static esp_err_t http_event(esp_http_client_event_t *e) {
   auto *out = static_cast<Http *>(e->user_data);
@@ -219,22 +233,30 @@ static void log_http_result(int status, esp_err_t err, size_t bytes,
            static_cast<long long>(deadline - now_ms()));
 }
 static int request(const Config &c, const std::string &path, Http &out,
-                   const std::string &body = "", const std::string &etag = "") {
+                   const std::string &body = "", const std::string &etag = "",
+                   bool retried_local = false) {
   const auto started = now_ms();
   if (now_ms() >= deadline) {
     error_text = "联网超时，已保留离线内容";
     log_http_result(-1, ESP_ERR_TIMEOUT, 0, started);
     return -1;
   }
-  const std::string url = c.server + path;
-  if (http_client && (http_server != c.server || http_ca != c.ca))
+  const bool local = !local_proxy_failed && !c.local_server.empty();
+  const auto &server = local ? c.local_server : c.server;
+  const auto &ca = local ? c.local_ca : c.ca;
+  const std::string name = local ? c.local_name : "";
+  const std::string url = server + path;
+  if (http_client && (http_server != server || http_ca != ca || http_name != name))
     close_http();
   if (!http_client) {
-    http_server = c.server;
-    http_ca = c.ca;
+    http_server = server;
+    http_ca = ca;
+    http_name = name;
     esp_http_client_config_t h{};
     h.url = url.c_str();
-    h.timeout_ms = std::clamp<int64_t>(deadline - now_ms(), 1, 5000);
+    h.timeout_ms = std::clamp<int64_t>(deadline - now_ms(), 1, local ? 2500 : external_cache_enabled() ? 15000 : 5000);
+    h.user_agent = "Readocs/0.2.7 (PaperDIY; ESP32-S3)";
+    h.common_name = http_name.empty() ? nullptr : http_name.c_str();
     h.event_handler = http_event;
     h.disable_auto_redirect = true;
     h.keep_alive_enable = true;
@@ -259,7 +281,7 @@ static int request(const Config &c, const std::string &path, Http &out,
   bool configured =
       esp_http_client_set_url(client, url.c_str()) == ESP_OK &&
       esp_http_client_set_timeout_ms(
-          client, std::clamp<int64_t>(deadline - now_ms(), 1, 5000)) ==
+          client, std::clamp<int64_t>(deadline - now_ms(), 1, local ? 2500 : external_cache_enabled() ? 15000 : 5000)) ==
           ESP_OK &&
       esp_http_client_set_user_data(client, &out) == ESP_OK &&
       header("X-Protocol-Version", "1") &&
@@ -289,6 +311,15 @@ static int request(const Config &c, const std::string &path, Http &out,
   esp_http_client_set_post_field(client, nullptr, 0);
   if (err != ESP_OK || out.overflow)
     close_http();
+  if (err != ESP_OK && !out.overflow && body.empty() && local) {
+    out.body.clear(); out.etag.clear();
+    // Publishing a checkpoint can outlast the proxy's keep-alive timeout.
+    // Retry a safe GET on a fresh local connection before abandoning LAN.
+    if (!retried_local && now_ms() < deadline)
+      return request(c, path, out, body, etag, true);
+    local_proxy_failed = true;
+    return request(c, path, out, body, etag);
+  }
   if (err != ESP_OK && !out.overflow && body.empty() && !http_retry_used &&
       deadline - now_ms() > 5000) {
     http_retry_used = true;
@@ -326,8 +357,12 @@ static bool download(const Config &c, cJSON *ref, std::string &id) {
   if (!valid_hash(id) || bytes < 1 || bytes > 300 * 1024 ||
       str(ref, "sha256") != id)
     return body_failure("reference", "正文引用超出限制或校验无效，旧内容已保留");
-  if (sha256(read_file(id)) == id)
+  if (cache_body_verified(id) || sha256(read_file(id)) == id)
     return true;
+  if (!cache_has_space(bytes)) {
+    storage_full = true;
+    return body_failure("storage_full", "SD 卡空间不足，已下载内容已保留");
+  }
   auto *chunks = cJSON_GetObjectItemCaseSensitive(ref, "chunks");
   int count = cJSON_GetArraySize(chunks);
   if (!cJSON_IsArray(chunks) || !count || count > 10 ||
@@ -371,6 +406,7 @@ static bool download(const Config &c, cJSON *ref, std::string &id) {
   }
   if (!write_file(id, body))
     return body_failure("body_write", "正文缓存写入失败，旧内容已保留");
+  sync_made_progress = true;
   return true;
 }
 static constexpr size_t directory_limit = 512 * 1024;
@@ -396,6 +432,7 @@ static bool save_directory_progress(const std::vector<Entry> &entries,
     cJSON_AddStringToObject(item, "document_id", e.document_id.c_str());
     cJSON_AddStringToObject(item, "title", e.title.c_str());
     cJSON_AddStringToObject(item, "snapshot_id", e.snapshot_id.c_str());
+    cJSON_AddStringToObject(item, "target_snapshot_id", e.target_snapshot_id.c_str());
     cJSON_AddItemToArray(array, item);
   }
   auto hash = sha256(serialize(root.get()));
@@ -421,9 +458,9 @@ static void compact_directory_progress(const std::string &source,
   cJSON *item;
   cJSON_ArrayForEach(item, array)
       entries.push_back({str(item, "source_id"), str(item, "document_id"),
-                         str(item, "title"), str(item, "snapshot_id")});
+                         str(item, "title"), str(item, "snapshot_id"), str(item, "target_snapshot_id")});
   auto compact = entries;
-  trim_cached_articles(compact, source, document);
+  trim_cached_articles(compact, source, document, "", "", external_cache_enabled());
   if (compact == entries)
     return;
   // This also completes a migration interrupted after the active-index
@@ -449,15 +486,27 @@ static bool fetch_entry(const Config &c, Entry &entry) {
   if (!item || str(item.get(), "document_id") != entry.document_id)
     return body_failure("reference_json", "正文引用返回无效，旧内容已保留");
   auto *ref = cJSON_GetObjectItemCaseSensitive(item.get(), "snapshot");
-  if (cJSON_IsNull(ref))
-    return true; // Discovery precedes the independent upstream body job.
+  if (cJSON_IsNull(ref)) {
+    entry.target_snapshot_id = "-"; // Known not ready; wait for a new manifest.
+    return true;
+  }
   if (!cJSON_IsObject(ref))
     return body_failure("reference_json", "正文引用返回无效，旧内容已保留");
   std::string id;
   if (!download(c, ref, id))
     return false;
-  entry.snapshot_id = id;
+  entry.snapshot_id = entry.target_snapshot_id = id;
   return true;
+}
+static void repair_external_entries(std::vector<Entry> &entries) {
+  if (!external_cache_enabled()) return;
+  // Verify once in the network task, rather than reading every document on
+  // each key wake. Missing/damaged card objects are fetched again, and must
+  // not prevent an unrelated verified batch from committing.
+  for (auto &entry : entries)
+    if (!entry.snapshot_id.empty() && !cache_body_verified(entry.snapshot_id) &&
+        sha256(read_file(entry.snapshot_id)) != entry.snapshot_id)
+      entry.snapshot_id.clear();
 }
 static bool sync(bool manual) {
   auto c = config_copy();
@@ -476,6 +525,7 @@ static bool sync(bool manual) {
     old = model.entries;
     old_sources = model.sources;
   }
+  repair_external_entries(old);
   const auto selected = current_article();
   if (!compact_cache_for_download(
           old, selected.first, selected.second,
@@ -487,13 +537,17 @@ static bool sync(bool manual) {
             redraw = true;
             return true;
           },
-          clear_directory_progress, [] { collect_cache(true); })) {
+          clear_directory_progress, [] { collect_cache(true); }, external_cache_enabled())) {
     error_text = "缓存空间不足，旧版本已保留";
     return false;
   }
   compact_directory_progress(selected.first, selected.second);
+  // An added SD card expands the existing prefetch set, even if the
+  // upstream manifest has not changed. Do not strand missing bodies on 304.
+  const bool missing = external_cache_enabled() && std::any_of(old.begin(), old.end(),
+      [](const Entry &e) { return e.snapshot_id.empty() && e.target_snapshot_id != "-"; });
   Http out{{}, {}, 8192};
-  int status = request(c, "/v1/sync", out, "", manual ? "" : etag);
+  int status = request(c, "/v1/sync", out, "", manual || missing ? "" : etag);
   if (status != 200 && status != 304)
     return false;
   if (status == 200) {
@@ -504,7 +558,6 @@ static bool sync(bool manual) {
       return false;
     }
     std::vector<Entry> entries;
-    std::vector<std::string> unchanged_snapshots;
     bool complete = true;
     auto *sources = cJSON_GetObjectItemCaseSensitive(manifest.get(), "sources");
     std::vector<Source> declared_sources;
@@ -553,7 +606,12 @@ static bool sync(bool manual) {
         cJSON_ArrayForEach(
             item, cJSON_GetObjectItemCaseSensitive(pending.get(), "entries")) {
           entries.push_back({str(item, "source_id"), str(item, "document_id"),
-                             str(item, "title"), str(item, "snapshot_id")});
+                             str(item, "title"), str(item, "snapshot_id"), str(item, "target_snapshot_id")});
+          // A body-only manifest update preserves the directory revision.
+          // Recheck staged targets once when its ETag changes, otherwise a
+          // completed checkpoint could acknowledge unseen newer bodies.
+          if (str(pending.get(), "etag") != out.etag)
+            entries.back().target_snapshot_id.clear();
         }
       }
     }
@@ -604,17 +662,16 @@ static bool sync(bool manual) {
         return false;
       cJSON *item;
       cJSON_ArrayForEach(item, items) {
-        Entry e{sid, str(item, "document_id"), str(item, "title"), ""};
-        if (!safe_id(e.document_id) || e.title.size() > 1024)
+        Entry e{sid, str(item, "document_id"), str(item, "title"), "", str(item, "snapshot_id")};
+        if (!safe_id(e.document_id) || e.title.size() > 1024 ||
+            (!e.target_snapshot_id.empty() && !valid_hash(e.target_snapshot_id)))
           return false;
+        if (e.target_snapshot_id.empty()) e.target_snapshot_id = "-";
         auto prior = std::find_if(old.begin(), old.end(), [&](const Entry &p) {
           return p.source_id == sid && p.document_id == e.document_id;
         });
         if (prior != old.end()) {
           e.snapshot_id = prior->snapshot_id;
-          if (!e.snapshot_id.empty() &&
-              e.snapshot_id == str(item, "snapshot_id"))
-            unchanged_snapshots.push_back(e.snapshot_id);
         }
         entries.push_back(e);
       }
@@ -639,7 +696,7 @@ static bool sync(bool manual) {
       return false;
     }
     const auto current = current_article();
-    const auto keep = cached_article_mask(entries, current.first, current.second);
+    const auto keep = cached_article_mask(entries, current.first, current.second, "", "", external_cache_enabled());
     prepare_download_space();
     for (size_t i = 0; i < entries.size(); ++i) {
       auto &e = entries[i];
@@ -647,13 +704,27 @@ static bool sync(bool manual) {
         e.snapshot_id.clear();
         continue;
       }
-      if (std::find(unchanged_snapshots.begin(), unchanged_snapshots.end(),
-                    e.snapshot_id) != unchanged_snapshots.end() &&
-          valid_hash(e.snapshot_id) &&
-          sha256(read_file(e.snapshot_id)) == e.snapshot_id)
+      if (external_cache_enabled() && e.target_snapshot_id == "-") continue;
+      if (e.snapshot_id == e.target_snapshot_id && valid_hash(e.snapshot_id) &&
+          (cache_body_verified(e.snapshot_id) || sha256(read_file(e.snapshot_id)) == e.snapshot_id))
         continue;
-      if (now_ms() + 1000 >= deadline || !fetch_entry(c, e))
+      if (now_ms() + 1000 >= deadline) { complete = false; break; }
+      if (!fetch_entry(c, e) || (external_cache_enabled() && e.snapshot_id.empty() && e.target_snapshot_id != "-"))
         complete = false;
+      // Persist each batch before starting more network work. A reset resumes
+      // from the last verified body; the old reader index remains the fallback.
+      if (external_cache_enabled() && (i + 1) % 12 == 0) {
+        if (!commit_cache(entries, etag, declared_sources) ||
+            !save_directory_progress(entries, out.etag, directory_revision, source_index, 0))
+          return false;
+        {
+          std::lock_guard<std::mutex> g(model.mutex);
+          model.entries = entries;
+          model.sources = declared_sources;
+        }
+        redraw = true;
+      }
+      if (storage_full) { complete = false; break; }
     }
     const auto saved_etag = complete ? out.etag : etag;
     if (!commit_cache(entries, saved_etag, declared_sources)) {
@@ -673,7 +744,7 @@ static bool sync(bool manual) {
       return false;
     {
       std::lock_guard<std::mutex> g(model.mutex);
-      model.sync_pending = !complete;
+      model.sync_pending = !complete && !storage_full;
     }
     collect_cache(); // Release versions older than the committed fallback.
     redraw = true;
@@ -683,7 +754,7 @@ static bool sync(bool manual) {
     // set; a nonempty local reference must not make an old body permanent.
     const auto current = current_article();
     auto entries = old;
-    trim_cached_articles(entries, current.first, current.second);
+    trim_cached_articles(entries, current.first, current.second, "", "", external_cache_enabled());
     auto selected =
         std::find_if(entries.begin(), entries.end(), [&](const Entry &e) {
           return e.source_id == current.first && e.document_id == current.second;
@@ -702,6 +773,7 @@ static bool sync(bool manual) {
     }
     collect_cache();
   }
+  if (storage_full) { set_status("SD 卡空间不足，已下载内容已保留"); return true; }
   if (manual) {
     Http refresh{{}, {}, 2048};
     int s = request(c, "/v1/refresh", refresh, "{}");
@@ -742,6 +814,7 @@ static bool download_article(const cJSON *input) {
     sources = model.sources;
     etag = model.etag;
   }
+  repair_external_entries(entries);
   auto selected =
       std::find_if(entries.begin(), entries.end(), [&](const Entry &e) {
         return e.source_id == source && e.document_id == doc;
@@ -756,7 +829,7 @@ static bool download_article(const cJSON *input) {
   // Selection can change while the queued download is running. Keep both the
   // displayed selection and its just-completed request until the next sync.
   const auto current = current_article();
-  trim_cached_articles(entries, current.first, current.second, source, doc);
+  trim_cached_articles(entries, current.first, current.second, source, doc, external_cache_enabled());
   if (!commit_cache(entries, etag, sources))
     return body_failure("cache_commit", "目录缓存保存失败，旧内容已保留");
   {
@@ -846,6 +919,9 @@ static esp_err_t web(httpd_req_t *req) {
       std::lock_guard<std::mutex> g(model.mutex);
       cJSON_AddStringToObject(j.get(), "session", model.ap_session.c_str());
       cJSON_AddStringToObject(j.get(), "status", model.status.c_str());
+    cJSON_AddBoolToObject(j.get(), "sync_pending", model.sync_pending);
+    cJSON_AddBoolToObject(j.get(), "local_proxy_configured", !model.config.local_server.empty());
+    cJSON_AddBoolToObject(j.get(), "local_proxy_fallback", local_proxy_failed.load());
       auto *a = cJSON_AddArrayToObject(j.get(), "networks");
       for (const auto &p : model.config.networks)
         cJSON_AddItemToArray(a, cJSON_CreateString(p.ssid.c_str()));
@@ -939,12 +1015,24 @@ void init_network() {
 }
 static void status_console() {
   Json j(cJSON_CreateObject());
-  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.6");
+  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.7");
   cJSON_AddStringToObject(j.get(), "font_family", "Noto Sans SC");
   cJSON_AddNumberToObject(j.get(), "font_weight", reader_font_weight);
   cJSON_AddBoolToObject(j.get(), "fonts_ready", reader_fonts_ready());
   cJSON_AddNumberToObject(j.get(), "font_revision", font_asset_revision);
   cJSON_AddNumberToObject(j.get(), "emoji_sequences", emoji_sequence_count);
+  const auto storage = sd_storage_capacity();
+  cJSON_AddBoolToObject(j.get(), "sd_available", storage.available);
+  cJSON_AddBoolToObject(j.get(), "external_cache", external_cache_enabled());
+  cJSON_AddNumberToObject(j.get(), "sd_total_bytes", storage.total);
+  cJSON_AddNumberToObject(j.get(), "sd_free_bytes", storage.free);
+  cJSON_AddNumberToObject(j.get(), "sd_reserved_bytes", sd_reserved_bytes);
+  wifi_ap_record_t access_point{};
+  if (esp_wifi_sta_get_ap_info(&access_point) == ESP_OK)
+    cJSON_AddNumberToObject(j.get(), "wifi_rssi", access_point.rssi);
+  wifi_ps_type_t power_save;
+  if (esp_wifi_get_ps(&power_save) == ESP_OK)
+    cJSON_AddNumberToObject(j.get(), "wifi_power_save", power_save);
   cJSON_AddBoolToObject(j.get(), "connected", connected.load());
   cJSON_AddBoolToObject(j.get(), "busy", networking.load());
   cJSON_AddNumberToObject(j.get(), "uptime_ms", now_ms());
@@ -957,6 +1045,9 @@ static void status_console() {
   {
     std::lock_guard<std::mutex> g(model.mutex);
     cJSON_AddStringToObject(j.get(), "status", model.status.c_str());
+    cJSON_AddBoolToObject(j.get(), "sync_pending", model.sync_pending);
+    cJSON_AddBoolToObject(j.get(), "local_proxy_configured", !model.config.local_server.empty());
+    cJSON_AddBoolToObject(j.get(), "local_proxy_fallback", local_proxy_failed.load());
     cJSON_AddNumberToObject(j.get(), "font_size", model.config.font_size);
     cJSON_AddStringToObject(j.get(), "ip", model.ip.c_str());
     cJSON_AddStringToObject(j.get(), "ssid", model.ssid.c_str());
@@ -1085,7 +1176,7 @@ void console_task(void *) {
     } else if (cmd == "reboot")
       esp_restart();
     else if (cmd == "setup" || cmd == "wifi" || cmd == "bind" ||
-             cmd == "check" || cmd == "forget") {
+             cmd == "check" || cmd == "forget" || cmd == "local_proxy") {
       enqueue(cmd, line);
       std::printf("ACCEPTED %s\n", cmd.c_str());
     } else
@@ -1115,8 +1206,18 @@ void network_task(void *) {
       // starting Wi-Fi, TLS, filesystem, or HTTP operations.
       std::lock_guard<std::mutex> awake(ui_sleep_mutex);
     }
-    deadline = now_ms() + (action->type == "download" ? 60000 : 20000);
+    deadline = now_ms() + (external_cache_enabled() &&
+        (action->type == "sync" || action->type == "check") ? 120000 :
+        action->type == "download" ? 60000 : 20000);
+    sync_made_progress = storage_full = false;
+    if (external_cache_enabled()) {
+      const auto capacity = sd_storage_capacity();
+      ESP_LOGI("readocs-sd", "sync capacity available=%d total=%llu free=%llu reserve=%llu",
+               capacity.available, (unsigned long long)capacity.total,
+               (unsigned long long)capacity.free, (unsigned long long)sd_reserved_bytes);
+    }
     http_retry_used = false;
+    local_proxy_failed = false;
     error_text.clear();
     bool ok = true;
     Json input(cJSON_Parse(action->json.c_str()));
@@ -1201,6 +1302,9 @@ void network_task(void *) {
         candidate.server = server;
         candidate.ca = ca;
         candidate.token.clear();
+        candidate.local_server.clear();
+        candidate.local_ca.clear();
+        candidate.local_name.clear();
         ok = ensure_wifi() && ensure_time();
         if (ok) {
           Json body(cJSON_CreateObject());
@@ -1223,6 +1327,20 @@ void network_task(void *) {
         if (ok)
           set_status("设备已绑定，按住 A 检查更新");
       }
+    } else if (action->type == "local_proxy") {
+      auto server = str(input.get(), "server"), ca = str(input.get(), "ca"), name = str(input.get(), "name");
+      if (name.size() > 253 || name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") != std::string::npos || (!server.empty() && (server.rfind("https://", 0) != 0 ||
+           server.size() > 256 || server.find_first_of("\r\n?#@") != std::string::npos || ca.empty())) || ca.size() > 6144) {
+        ok = false; error_text = "局域网代理地址或证书无效";
+      } else {
+        while (!server.empty() && server.back() == '/') server.pop_back();
+        c.local_server = server; c.local_ca = server.empty() ? "" : ca;
+        c.local_name = server.empty() ? "" : name;
+        ok = save_config(c);
+        if (ok) {
+          std::lock_guard<std::mutex> g(model.mutex); model.config = c;
+        }
+      }
     } else if (action->type == "download")
       ok = download_article(input.get());
     else if (action->type == "sync" || action->type == "check")
@@ -1242,6 +1360,12 @@ void network_task(void *) {
       esp_wifi_stop();
     }
     networking = false;
+    bool pending;
+    { std::lock_guard<std::mutex> g(model.mutex); pending = model.sync_pending; }
+    // Keep progressing while actual downloads succeed. If the proxy has no
+    // ready bodies, the normal 60-second/backoff schedule resumes instead.
+    if (ok && external_cache_enabled() && pending && sync_made_progress && !storage_full)
+      enqueue("sync");
     std::printf("RESULT {\"command\":\"%s\",\"ok\":%s}\n", action->type.c_str(),
                 ok ? "true" : "false");
     std::fill(action->json.begin(), action->json.end(), 0);

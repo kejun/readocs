@@ -18,10 +18,14 @@ namespace rd {
 #include "gc_types.hpp"
 using esp_err_t = int;
 static constexpr int ESP_OK = 0, ESP_ERR_NVS_NOT_FOUND = 1,
-                     ESP_ERR_INVALID_SIZE = 2, ESP_FAIL = 3, handle = 1;
+                     ESP_ERR_INVALID_SIZE = 2, ESP_FAIL = 3, handle = 1, index_handle = 1;
 static constexpr char TAG[] = "readocs-store";
 static std::string cache_root, read_failure, pointer_failure, set_failure;
 static std::map<std::string, std::string> keys;
+static int key_handle(const char *) { return handle; }
+static const std::string &cache_directory() { return cache_root; }
+static bool cache_body_verified(const std::string &) { return false; }
+static void forget_verified(const std::string &) {}
 static bool commit_failure = false, write_failure = false;
 static unsigned commits = 0;
 static std::vector<std::string> logs;

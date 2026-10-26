@@ -1,5 +1,6 @@
 #include "readocs.hpp"
 #include "cache_file.hpp"
+#include "external_storage.hpp"
 #include "position_storage.hpp"
 #include "source_metadata.hpp"
 #include <cerrno>
@@ -17,7 +18,36 @@
 
 namespace rd {
 static constexpr char TAG[] = "readocs-store";
-static nvs_handle_t handle;
+static nvs_handle_t handle, index_handle;
+static std::string root_directory = "/cache";
+static std::mutex verified_mutex;
+static std::set<std::string> verified_files;
+const std::string &cache_directory() { return root_directory; }
+bool external_cache_enabled() { return root_directory != "/cache"; }
+bool cache_has_space(uint64_t bytes) {
+  if (!external_cache_enabled()) return true;
+  const auto space = sd_storage_capacity();
+  return sd_can_fit(space, bytes);
+}
+bool cache_body_verified(const std::string &id) {
+  if (!external_cache_enabled()) return false;
+  std::lock_guard<std::mutex> lock(verified_mutex);
+  return verified_files.count(id) != 0;
+}
+static void remember_verified(const std::string &id) {
+  if (!external_cache_enabled()) return;
+  std::lock_guard<std::mutex> lock(verified_mutex);
+  if (verified_files.size() >= 4096) verified_files.clear();
+  verified_files.insert(id);
+}
+static nvs_handle_t key_handle(const char *key) {
+  return !std::strcmp(key, "active") || !std::strcmp(key, "previous") ||
+         !std::strcmp(key, "catalog_stage") ? index_handle : handle;
+}
+static void forget_verified(const std::string &id) {
+  std::lock_guard<std::mutex> lock(verified_mutex);
+  verified_files.erase(id);
+}
 Position position;
 
 std::string sha256(const std::string &s) {
@@ -35,23 +65,36 @@ bool valid_hash(const std::string &s) {
          s.find_first_not_of("0123456789abcdef") == std::string::npos;
 }
 std::string read_file(const std::string &name, size_t limit) {
-  if (name.find('/') != std::string::npos || name.size() > 70)
+  if (!valid_hash(name)) return "";
+  auto body = read_cache_file(cache_directory() + "/" + name, limit);
+  if (external_cache_enabled() && sha256(body) != name) {
+    forget_verified(name);
     return "";
-  return read_cache_file("/cache/" + name, limit);
+  }
+  if (!body.empty()) remember_verified(name);
+  return body;
 }
 bool write_file(const std::string &name, const std::string &body) {
   if (name.find('/') != std::string::npos || name.size() > 70)
     return false;
   if (!valid_hash(name))
     return false;
-  return publish_cache_file("/cache/" + name, body, name, sha256);
+  // The reserved headroom must remain available to publish the final index
+  // and checkpoint after body prefetch reaches its low-space boundary.
+  if (external_cache_enabled() && !sd_can_publish(sd_storage_capacity(), body.size())) {
+    errno = ENOSPC;
+    return false;
+  }
+  const bool ok = publish_cache_file(cache_directory() + "/" + name, body, name, sha256);
+  if (ok) remember_verified(name);
+  return ok;
 }
 static std::string get_string(const char *key) {
   size_t size = 0;
-  if (nvs_get_str(handle, key, nullptr, &size) != ESP_OK || size > 24576)
+  if (nvs_get_str(key_handle(key), key, nullptr, &size) != ESP_OK || size > 24576)
     return "";
   std::string out(size, '\0');
-  if (nvs_get_str(handle, key, out.data(), &size) != ESP_OK)
+  if (nvs_get_str(key_handle(key), key, out.data(), &size) != ESP_OK)
     return "";
   if (!out.empty())
     out.pop_back();
@@ -59,7 +102,7 @@ static std::string get_string(const char *key) {
 }
 static bool cache_pointer(const char *key, std::string &out) {
   size_t size = 0;
-  auto err = nvs_get_str(handle, key, nullptr, &size);
+  auto err = nvs_get_str(key_handle(key), key, nullptr, &size);
   if (err == ESP_ERR_NVS_NOT_FOUND) {
     out.clear();
     return true;
@@ -72,7 +115,7 @@ static bool cache_pointer(const char *key, std::string &out) {
     return false;
   }
   std::string value(size, '\0');
-  err = nvs_get_str(handle, key, value.data(), &size);
+  err = nvs_get_str(key_handle(key), key, value.data(), &size);
   if (err != ESP_OK || size != 65 || value.back() != '\0') {
     ESP_LOGW(TAG, "cache gc aborted stage=pointer_read key=%s err=%s", key,
              esp_err_to_name(err));
@@ -107,6 +150,9 @@ bool save_config(const Config &c) {
   }
   cJSON_AddStringToObject(root.get(), "server", c.server.c_str());
   cJSON_AddStringToObject(root.get(), "ca", c.ca.c_str());
+  cJSON_AddStringToObject(root.get(), "local_server", c.local_server.c_str());
+  cJSON_AddStringToObject(root.get(), "local_ca", c.local_ca.c_str());
+  cJSON_AddStringToObject(root.get(), "local_name", c.local_name.c_str());
   cJSON_AddStringToObject(root.get(), "token", c.token.c_str());
   cJSON_AddStringToObject(root.get(), "device_id", c.device_id.c_str());
   cJSON_AddNumberToObject(root.get(), "interval", c.interval);
@@ -129,22 +175,23 @@ bool save_directory_progress_file(const std::string &body) {
   if (id == get_string("catalog_stage"))
     return true;
   auto old = get_string("catalog_stage");
-  bool ok = nvs_set_str(handle, "catalog_stage", id.c_str()) == ESP_OK &&
-            nvs_commit(handle) == ESP_OK;
+  bool ok = nvs_set_str(index_handle, "catalog_stage", id.c_str()) == ESP_OK &&
+            nvs_commit(index_handle) == ESP_OK;
   // Only obsolete progress files are removed; active/previous reader indexes
   // remain untouched.
   if (ok && valid_hash(old) && old != id)
-    std::remove(("/cache/" + old).c_str());
+    std::remove((cache_directory() + "/" + old).c_str());
   return ok;
 }
 void clear_directory_progress() {
   auto id = get_string("catalog_stage");
-  if (nvs_erase_key(handle, "catalog_stage") == ESP_OK &&
-      nvs_commit(handle) == ESP_OK && valid_hash(id))
-    std::remove(("/cache/" + id).c_str());
+  if (nvs_erase_key(index_handle, "catalog_stage") == ESP_OK &&
+      nvs_commit(index_handle) == ESP_OK && valid_hash(id))
+    std::remove((cache_directory() + "/" + id).c_str());
 }
 static bool load_index(const std::string &id, std::vector<Entry> &out,
-                       std::string &etag, std::vector<Source> &sources) {
+                       std::string &etag, std::vector<Source> &sources,
+                       bool verify_bodies = true) {
   if (!valid_hash(id))
     return false;
   auto body = read_file(id, 512 * 1024);
@@ -160,10 +207,10 @@ static bool load_index(const std::string &id, std::vector<Entry> &out,
   cJSON *j;
   cJSON_ArrayForEach(j, array) {
     Entry e{str(j, "source_id"), str(j, "document_id"), str(j, "title"),
-            str(j, "snapshot_id")};
+            str(j, "snapshot_id"), str(j, "target_snapshot_id")};
     if (!e.snapshot_id.empty()) {
-      auto doc = read_file(e.snapshot_id);
-      if (!valid_hash(e.snapshot_id) || sha256(doc) != e.snapshot_id)
+      auto doc = verify_bodies ? read_file(e.snapshot_id) : "";
+      if (!valid_hash(e.snapshot_id) || (verify_bodies && sha256(doc) != e.snapshot_id))
         return false;
     }
     entries.push_back(e);
@@ -187,6 +234,7 @@ bool load_storage() {
       nvs_open_from_partition("settings", "readocs", NVS_READWRITE, &handle) !=
           ESP_OK)
     return false;
+  index_handle = handle;
   Json root(cJSON_Parse(get_string("config").c_str()));
   if (root) {
     cJSON *j;
@@ -197,6 +245,9 @@ bool load_storage() {
     }
     model.config.server = str(root.get(), "server");
     model.config.ca = str(root.get(), "ca");
+    model.config.local_server = str(root.get(), "local_server");
+    model.config.local_ca = str(root.get(), "local_ca");
+    model.config.local_name = str(root.get(), "local_name");
     model.config.token = str(root.get(), "token");
     model.config.device_id = str(root.get(), "device_id");
     model.config.interval = num(root.get(), "interval", 3600);
@@ -252,6 +303,42 @@ bool load_storage() {
   }
   if (!load_index(get_string("active"), model.entries, model.etag, model.sources))
     load_index(get_string("previous"), model.entries, model.etag, model.sources);
+  // SD metadata has independent pointers. Removing a card restores the
+  // original internal cache; migration never erases those files or pointers.
+  if (mount_sd_storage()) {
+    nvs_handle_t sd_handle;
+    if (nvs_open_from_partition("settings", "readocs_sd", NVS_READWRITE, &sd_handle) == ESP_OK) {
+      auto original_entries = model.entries;
+      auto original_sources = model.sources;
+      auto original_etag = model.etag;
+      root_directory = sd_cache_directory();
+      index_handle = sd_handle;
+      bool loaded = load_index(get_string("active"), model.entries, model.etag, model.sources, false) ||
+                    load_index(get_string("previous"), model.entries, model.etag, model.sources, false);
+      if (!loaded) {
+        bool migrated = true;
+        for (const auto &entry : original_entries) {
+          if (entry.snapshot_id.empty()) continue;
+          auto body = read_cache_file("/cache/" + entry.snapshot_id, 310 * 1024);
+          if (sha256(body) != entry.snapshot_id || !write_file(entry.snapshot_id, body)) { migrated = false; break; }
+        }
+        migrated = migrated && commit_cache(original_entries, original_etag, original_sources);
+        if (migrated) {
+          const auto active = get_string("active");
+          nvs_set_str(index_handle, "previous", active.c_str());
+          nvs_erase_key(index_handle, "catalog_stage");
+          nvs_commit(index_handle);
+        } else {
+          root_directory = "/cache";
+          index_handle = handle;
+          nvs_close(sd_handle);
+        }
+        model.entries = std::move(original_entries);
+        model.sources = std::move(original_sources);
+        model.etag = original_etag;
+      }
+    }
+  }
   model.displayed_snapshot = get_string("displayed");
   Json pos(cJSON_Parse(get_string("position").c_str()));
   if (pos) {
@@ -283,6 +370,7 @@ bool commit_cache(const std::vector<Entry> &entries, const std::string &etag,
     if (e.snapshot_id.empty())
       continue;
     errno = 0;
+    if (cache_body_verified(e.snapshot_id)) continue;
     auto body = read_file(e.snapshot_id);
     if (sha256(body) != e.snapshot_id)
       return cache_commit_failure("body_verify", errno, ESP_OK, body.size());
@@ -298,6 +386,7 @@ bool commit_cache(const std::vector<Entry> &entries, const std::string &etag,
     cJSON_AddStringToObject(j, "document_id", e.document_id.c_str());
     cJSON_AddStringToObject(j, "title", e.title.c_str());
     cJSON_AddStringToObject(j, "snapshot_id", e.snapshot_id.c_str());
+    cJSON_AddStringToObject(j, "target_snapshot_id", e.target_snapshot_id.c_str());
     cJSON_AddItemToArray(a, j);
   }
   auto body = serialize(root.get()), id = sha256(body);
@@ -310,17 +399,17 @@ bool commit_cache(const std::vector<Entry> &entries, const std::string &etag,
     return cache_commit_failure("index_write", errno, ESP_OK, body.size());
   auto old = get_string("active");
   if (!old.empty()) {
-    auto err = nvs_set_str(handle, "previous", old.c_str());
+    auto err = nvs_set_str(index_handle, "previous", old.c_str());
     if (err != ESP_OK)
       return cache_commit_failure("previous_set", 0, err);
-    err = nvs_commit(handle);
+    err = nvs_commit(index_handle);
     if (err != ESP_OK)
       return cache_commit_failure("previous_commit", 0, err);
   }
-  auto err = nvs_set_str(handle, "active", id.c_str());
+  auto err = nvs_set_str(index_handle, "active", id.c_str());
   if (err != ESP_OK)
     return cache_commit_failure("active_set", 0, err);
-  err = nvs_commit(handle);
+  err = nvs_commit(index_handle);
   if (err != ESP_OK)
     return cache_commit_failure("active_commit", 0, err);
   return true;
@@ -425,8 +514,8 @@ void collect_cache(bool reclaim_previous) {
     std::string etag;
     if (!active.empty() && active != previous &&
         load_index(active, verified, etag, sources)) {
-      if (nvs_set_str(handle, "previous", active.c_str()) != ESP_OK ||
-          nvs_commit(handle) != ESP_OK) {
+      if (nvs_set_str(index_handle, "previous", active.c_str()) != ESP_OK ||
+          nvs_commit(index_handle) != ESP_OK) {
         ESP_LOGW(TAG, "Unable to reclaim previous cache version");
         return;
       }
@@ -437,13 +526,14 @@ void collect_cache(bool reclaim_previous) {
   keep.insert(previous_keep.begin(), previous_keep.end());
   if (!displayed.empty())
     keep.insert(displayed);
-  DIR *dir = opendir("/cache");
+  DIR *dir = opendir(cache_directory().c_str());
   if (!dir)
     return;
   while (auto *e = readdir(dir)) {
     std::string name = e->d_name;
     if (name[0] != '.' && !keep.count(name))
-      std::remove(("/cache/" + name).c_str());
+      if (std::remove((cache_directory() + "/" + name).c_str()) == 0)
+        forget_verified(name);
   }
   closedir(dir);
 }

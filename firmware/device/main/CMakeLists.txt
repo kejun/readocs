@@ -1,7 +1,7 @@
-idf_component_register(SRCS "main.cpp" "storage.cpp" "network.cpp" "reader.cpp" "reader_fonts.cpp" "input.cpp" "power_key.cpp"
+idf_component_register(SRCS "main.cpp" "storage.cpp" "external_storage.cpp" "network.cpp" "reader.cpp" "reader_fonts.cpp" "input.cpp" "power_key.cpp"
     PRIV_REQUIRES M5Unified M5GFX esp_wifi esp_event esp_netif nvs_flash
     esp_http_server esp_http_client mbedtls json esp_driver_usb_serial_jtag
-    esp_driver_gpio spiffs app_update esp_hw_support
+    esp_driver_gpio esp_driver_spi esp_driver_sdspi sdmmc fatfs spiffs app_update esp_hw_support
     INCLUDE_DIRS ".")
 
 # The shutdown cover lives at the repository root so it can be replaced without
