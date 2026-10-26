@@ -195,8 +195,8 @@ OAuth 回调有单次 state、浏览器绑定、会话期限及配置版本校�
 
 0.2.8 按[配网方案](wifi-provisioning-improvements.md)独立修复 P0 双栈访问检查，再实现 P1 路由、热点启动返回值、操作入队与会话复核、失败结果和有界轮询。HTTP TCP 连接绑定 AP 接口，额外检查本地和对端地址；热点关闭后仍停止空闲 Wi-Fi。物理确认配网后进入状态页，普通选择与正文绘制不变。USB 工具自动识别串口、支持取消热点并为排在 SD 同步后的命令留出时间。
 
-127 项全量回归、Ruff、差异检查及 SDK 构建通过，已备份、校验当前 4 MiB 应用槽后仅写 `0x20000`。镜像 3,849,424 字节，SHA-256 `4d181ee6dec360ca02b93118c5600f0d4fe52c44169c9c7a7cdfa80543443d4b`。实机确认为 0.2.8、IPv6 开启，原绑定、504/504 篇 SD 缓存、Medium 500 / 32 像素字号及 15 秒交互窗口保留，开机同步成功；热点启动、AP 地址与 DHCP 服务就绪后才报告 `setup_active=true`。手机页面与配网链路正在验收，P2 自动门户不在本轮完成范围。
+127 项全量回归、Ruff、差异检查及 SDK 构建通过，已备份、校验当前 4 MiB 应用槽后仅写 `0x20000`。镜像 3,849,424 字节，SHA-256 `4d181ee6dec360ca02b93118c5600f0d4fe52c44169c9c7a7cdfa80543443d4b`。实机确认为 0.2.8、IPv6 开启，原绑定、504/504 篇 SD 缓存、Medium 500 / 32 像素字号及 15 秒交互窗口保留，开机同步成功；热点启动、AP 地址与 DHCP 服务就绪后才报告 `setup_active=true`。2026-10-27 用户确认手机端“页面正常，配网成功”；故障恢复等独立真机验收边界见[配网记录](wifi-provisioning-improvements.md)，P2 自动门户不在本轮完成范围。
 
-热点在 APSTA → STA 的约 300,062 ms 后自动关闭，期间 USB 状态轮询未延长时限，关闭后无线停止；手机端结果仍待用户反馈，可通过菜单重新进入配网。
+热点在 APSTA → STA 的约 300,062 ms 后自动关闭，期间 USB 状态轮询未延长时限，关闭后无线停止；可通过菜单重新进入配网。
 
 同日按用户要求，将工作机 Homebrew cloudflared 2026.10.0 升至 2026.10.3。正式隧道先启动新副本，确认 4 条连接与 readiness 200，再逐条优雅退出旧实例；用户确认允许临时隧道更换 URL 后，对 Quick Tunnel 同样先启动并验证新地址返回 200。两个实际运行进程均从 2026.10.3 路径加载，正式配置逐字节保留，没有关闭 TLS 验证；已检查的源站为本机 HTTP 或 Readocs 自签名证书，没有发现受影响的 eMudhra 链。用户确认没有其他运行主机。新临时地址与私有验证报告位于 `artifacts/cloudflared-2026-10-27/`；依据为 [Cloudflare 官方公告](https://blog.cloudflare.com/emudhra-certificate-compromise/)及 [2026.10.3 发布](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.3)。
