@@ -2,13 +2,19 @@
 
 import asyncio
 import json
+import logging
 import re
 import secrets
 import time
 
 from .dates import upstream_time
-from .errors import Problem
+from .errors import TRANSIENT_ERRORS, Problem, retry_delay
 from .store import digest
+
+logger = logging.getLogger(__name__)
+DIRECTORY_TIMEOUT = 35
+DOCUMENT_TIMEOUT = 120
+DIRECTORY_MAX_FAILURES = 6
 
 
 def identifier(value):
@@ -128,13 +134,14 @@ class Library:
         # Commit each page before yielding; restart never loses the discovery queue.
         for _ in range(1):
             tasks = store.rows(
-                "SELECT * FROM feishu_frontier WHERE done=0 ORDER BY rowid LIMIT 1"
+                "SELECT * FROM feishu_frontier WHERE done=0 AND due<=? ORDER BY due,rowid LIMIT 1",
+                (time.time(),),
             )
             if not tasks:
                 break
             task = tasks[0]
             try:
-                async with asyncio.timeout(20):
+                async with asyncio.timeout(DIRECTORY_TIMEOUT):
                     docs, children, cursor = await self.page(task)
             except (Problem, TimeoutError) as error:
                 if not self.current(source):
@@ -147,11 +154,32 @@ class Library:
                     "RATE_LIMITED",
                 ):
                     raise
+                failures = task["failures"] + 1
+                delay = retry_delay(error, failures, source["interval"])
+                # Exhausted branches remain errors, preventing pruning while
+                # allowing future scans of healthy folders to start on time.
+                transient = (
+                    code in TRANSIENT_ERRORS and failures < DIRECTORY_MAX_FAILURES
+                )
                 with store.db:
                     store.db.execute(
-                        "UPDATE feishu_frontier SET done=1,error=? WHERE id=?",
-                        (code, task["id"]),
+                        "UPDATE feishu_frontier SET done=?,error=?,failures=?,due=? WHERE id=?",
+                        (
+                            int(not transient),
+                            code,
+                            failures,
+                            time.time() + delay,
+                            task["id"],
+                        ),
                     )
+                logger.warning(
+                    "feishu_directory_failed kind=%s task=%s code=%s failures=%d retry_in=%d",
+                    task["kind"],
+                    task["id"],
+                    code,
+                    failures,
+                    delay if transient else 0,
+                )
                 continue
             if not self.current(source):
                 return
@@ -174,7 +202,7 @@ class Library:
                 if cursor:
                     visited.append(cursor)
                 store.db.execute(
-                    "UPDATE feishu_frontier SET cursor=?,visited=?,done=? WHERE id=?",
+                    "UPDATE feishu_frontier SET cursor=?,visited=?,done=?,error=NULL,failures=0,due=0 WHERE id=?",
                     (cursor, json.dumps(visited), int(not cursor), task["id"]),
                 )
         if not self.current(source):
@@ -210,11 +238,11 @@ class Library:
         for item in store.rows(
             "SELECT i.*,d.updated AS content_updated_at FROM feishu_items i "
             "LEFT JOIN documents d ON d.source_id='feishu' AND d.id=i.id "
-            "WHERE i.due<=? ORDER BY i.due,i.id LIMIT 1",
+            "WHERE i.due<=? ORDER BY (i.error IS NULL),i.due,i.id LIMIT 1",
             (time.time(),),
         ):
             try:
-                async with asyncio.timeout(25):
+                async with asyncio.timeout(DOCUMENT_TIMEOUT):
                     doc = await self.feishu.fetch(
                         item["id"], item["url"], updated=item["content_updated_at"]
                     )
@@ -230,19 +258,24 @@ class Library:
                 ):
                     raise
                 failures = item["failures"] + 1
+                delay = retry_delay(error, failures, source["interval"])
                 with store.db:
                     store.db.execute(
                         "UPDATE feishu_items SET error=?,failures=?,due=? WHERE id=?",
                         (
                             code,
                             failures,
-                            time.time()
-                            + min(
-                                21600, source["interval"] * 2 ** min(failures - 1, 6)
-                            ),
+                            time.time() + delay,
                             item["id"],
                         ),
                     )
+                logger.warning(
+                    "feishu_document_failed document=%s code=%s failures=%d retry_in=%d",
+                    item["id"],
+                    code,
+                    failures,
+                    delay,
+                )
                 continue
             if not self.current(source):
                 return
@@ -255,12 +288,20 @@ class Library:
                 store.db.execute(
                     "UPDATE sources SET fetched=? WHERE id='feishu'", (time.time(),)
                 )
+            if item["error"]:
+                logger.info("feishu_document_recovered document=%s", item["id"])
         next_item = store.db.execute("SELECT MIN(due) FROM feishu_items").fetchone()[0]
-        due = (
-            time.time() + 1
-            if pending
-            else min(scan["next"], next_item if next_item is not None else scan["next"])
-        )
+        next_directory = store.db.execute(
+            "SELECT MIN(due) FROM feishu_frontier WHERE done=0"
+        ).fetchone()[0]
+        # A deferred subtree stays pending without spinning once per second or
+        # preventing other folders and document bodies from making progress.
+        deadlines = [
+            deadline for deadline in (next_directory, next_item) if deadline is not None
+        ]
+        if not pending:
+            deadlines.append(scan["next"])
+        due = min(deadlines) if deadlines else time.time() + source["interval"]
         failed = store.feishu_progress()["failed"]
         with store.db:
             store.db.execute(

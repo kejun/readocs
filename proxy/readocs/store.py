@@ -83,7 +83,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS feishu_frontier(
           id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL,
           cursor TEXT NOT NULL DEFAULT '', visited TEXT NOT NULL DEFAULT '[]',
-          done INTEGER NOT NULL DEFAULT 0, error TEXT);
+          done INTEGER NOT NULL DEFAULT 0, error TEXT,
+          due REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS oauth_states(
           hash TEXT PRIMARY KEY, session_hash TEXT NOT NULL, generation INTEGER NOT NULL,
           redirect TEXT NOT NULL, expires REAL NOT NULL);
@@ -99,6 +100,17 @@ class Store:
           lease_until REAL NOT NULL DEFAULT 0, retired_at REAL);
         UPDATE jobs SET state='queued' WHERE state='running';
         """)
+        frontier_columns = {
+            row["name"] for row in self.db.execute("PRAGMA table_info(feishu_frontier)")
+        }
+        for name, definition in (
+            ("due", "REAL NOT NULL DEFAULT 0"),
+            ("failures", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in frontier_columns:
+                self.db.execute(
+                    f"ALTER TABLE feishu_frontier ADD COLUMN {name} {definition}"
+                )
         if "created" not in {
             row["name"] for row in self.db.execute("PRAGMA table_info(documents)")
         }:
@@ -347,6 +359,7 @@ class Store:
                 self.put("feishu_scan", {**scan, "next": 0})
             with self.db:
                 self.db.execute("UPDATE feishu_items SET due=0")
+                self.db.execute("UPDATE feishu_frontier SET due=0 WHERE done=0")
         row = self.db.execute(
             "SELECT id FROM jobs WHERE source_id=?", (sid,)
         ).fetchone()

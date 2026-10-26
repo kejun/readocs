@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from urllib.parse import urlencode
 
@@ -11,6 +12,7 @@ DOCS = "https://open.feishu.cn/open-apis/docx/v1/documents/"
 API = "https://open.feishu.cn/open-apis/"
 USER_AUTH = API + "authen/v2/oauth/token"
 TOKEN_ERRORS = {99991661, 99991663, 99991664, 99991665, 99991668, 99991677}
+logger = logging.getLogger(__name__)
 
 
 class Feishu:
@@ -166,19 +168,50 @@ class Feishu:
                 }
             return self.cached["token"]
 
+    async def read(self, url, token, stage):
+        # Retry only idempotent reads, once, at the failed page. OAuth exchanges
+        # and rate limits must not be blindly replayed.
+        started = time.monotonic()
+        for attempt in range(2):
+            try:
+                return await self.network.json(
+                    "GET", url, headers={"Authorization": "Bearer " + token}
+                )
+            except Problem as error:
+                if error.code == "UPSTREAM_TIMEOUT" and attempt == 0:
+                    logger.warning(
+                        "feishu_request_retry stage=%s code=%s", stage, error.code
+                    )
+                    await asyncio.sleep(1)
+                    continue
+                logger.warning(
+                    "feishu_request_failed stage=%s code=%s attempts=%d elapsed=%.3f",
+                    stage,
+                    error.code,
+                    attempt + 1,
+                    time.monotonic() - started,
+                )
+                raise
+
     async def get(self, suffix, params=None, *, api=False):
         url = (
             (API if api else DOCS)
             + suffix
             + ("?" + urlencode(params) if params else "")
         )
+        stage = (
+            suffix.split("/", 1)[0]
+            if api
+            else ("blocks" if suffix.endswith("/blocks") else "document")
+        )
         failed = None
         for attempt in range(2):
             token = await self.access_token(failed)
-            status, obj = await self.network.json(
-                "GET", url, headers={"Authorization": "Bearer " + token}
-            )
+            status, obj = await self.read(url, token, stage)
             code = obj.get("code", 0)
+            if code == 99991400:
+                # Some older Feishu APIs report rate limits as HTTP 400 or 200.
+                raise Problem("RATE_LIMITED", "飞书暂时限流，请稍后重试", 429, 60)
             if (status == 401 or code in TOKEN_ERRORS) and attempt == 0:
                 # Only discard the token which actually failed; concurrent requests share its replacement.
                 failed = token

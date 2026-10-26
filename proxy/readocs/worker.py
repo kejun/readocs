@@ -1,10 +1,13 @@
 import asyncio
+import logging
 import random
 import time
 
 from .content import FEED_MAX_BYTES, FeedIdentities, parse_feed
-from .errors import Problem
+from .errors import Problem, retry_delay
 from .library import Library
+
+logger = logging.getLogger(__name__)
 
 
 class Worker:
@@ -149,15 +152,19 @@ class Worker:
                 (job["id"],),
             )
         try:
-            async with asyncio.timeout(60):
+            async with asyncio.timeout(180 if source["kind"] == "feishu" else 60):
                 await self.fetch(source)
         except (Problem, TimeoutError) as e:
             code = e.code if isinstance(e, Problem) else "UPSTREAM_TIMEOUT"
             failures = source["failures"] + 1
-            retry = min(
-                21600, source["interval"] * 2 ** min(failures - 1, 6)
+            retry = (
+                retry_delay(e, failures, source["interval"])
+                if source["kind"] == "feishu"
+                else max(
+                    min(21600, source["interval"] * 2 ** min(failures - 1, 6)),
+                    e.retry_after if isinstance(e, Problem) else 0,
+                )
             ) + random.uniform(0, 10)
-            retry = max(retry, e.retry_after if isinstance(e, Problem) else 0)
             with self.store.db:
                 self.store.db.execute(
                     "UPDATE sources SET error=?,checked=?,due=?,failures=? WHERE id=? AND generation=?",
@@ -170,6 +177,13 @@ class Worker:
                         source["generation"],
                     ),
                 )
+            logger.warning(
+                "source_sync_failed source=%s code=%s failures=%d retry_in=%.1f",
+                source["id"],
+                code,
+                failures,
+                retry,
+            )
         except Exception:  # noqa: BLE001 — isolate malformed upstream content without logging secrets
             # Never persist upstream payloads or exception strings which can contain secrets.
             with self.store.db:
