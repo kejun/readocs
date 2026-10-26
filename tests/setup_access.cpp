@@ -7,16 +7,19 @@
 namespace rd {
 struct { std::mutex mutex; bool ap = true; } model;
 struct httpd_req_t { int fd; };
-struct esp_netif_ip_info_t { struct { uint32_t addr; } ip; };
+struct esp_netif_ip_info_t { struct { uint32_t addr; } ip, netmask; };
 static int *ap_netif = nullptr;
 static bool ip_failure = false;
 static uint32_t ap_ip = htonl(INADDR_LOOPBACK);
+static int64_t clock_ms = 0, ap_activity = 0;
+static int64_t now_ms() { return clock_ms; }
 constexpr int ESP_OK = 0;
 #define CONFIG_LWIP_IPV6 1
 template<typename... Args> static void log(Args...) {}
 #define ESP_LOGW(...) log(__VA_ARGS__)
 static int esp_netif_get_ip_info(int *, esp_netif_ip_info_t *info) {
   info->ip.addr = ap_ip;
+  info->netmask.addr = htonl(0xffffff00);
   return ip_failure ? -1 : ESP_OK;
 }
 static int httpd_req_to_sockfd(httpd_req_t *req) { return req->fd; }
@@ -52,6 +55,7 @@ static bool socket_case(int family) {
   httpd_req_t req{accepted};
   bool allowed = on_ap(&req);
   if (allowed) {
+    clock_ms = 300000; assert(!on_ap(&req)); clock_ms = 0;
     model.ap = false; assert(!on_ap(&req)); model.ap = true;
     ap_ip = htonl(0x7f000002); assert(!on_ap(&req)); ap_ip = htonl(INADDR_LOOPBACK);
     ip_failure = true; assert(!on_ap(&req)); ip_failure = false;

@@ -6,7 +6,7 @@
 #include <mutex>
 #include <thread>
 using namespace rd;
-static std::mutex ui_sleep_mutex, pm1_lock;
+static std::mutex ui_sleep_mutex, pm1_lock, network_radio_mutex;
 static std::atomic<bool> networking{false}, input_idle{true}, power_off_requested{false};
 static std::atomic<bool> light_sleep_ok{true};
 static std::atomic<unsigned> light_sleeps{0};

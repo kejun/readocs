@@ -27,6 +27,7 @@
 #include <lwip/sockets.h>
 #include <sys/socket.h>
 #include "setup_access.hpp"
+#include "setup_page.hpp"
 #include <utility>
 
 namespace rd {
@@ -38,6 +39,16 @@ static int64_t deadline = 0;
 static std::string error_text = "";
 static bool sync_made_progress = false, storage_full = false;
 static std::atomic<bool> local_proxy_failed{false};
+static std::atomic<bool> associated{false};
+static const char *connection_error = "connection_failed";
+struct SetupOperation {
+  std::string state = "idle", code, message, kind;
+  unsigned id = 0;
+  bool pending = false;
+  int64_t close_at = 0;
+};
+static SetupOperation setup_operation; // Protected by model.mutex, including admission.
+static std::mutex network_radio_mutex;
 int64_t now_ms() { return esp_timer_get_time() / 1000; }
 void set_status(const std::string &s, bool visible) {
   {
@@ -47,10 +58,14 @@ void set_status(const std::string &s, bool visible) {
   if (visible)
     redraw = true;
 }
-void enqueue(const std::string &type, const std::string &json) {
+bool enqueue(const std::string &type, const std::string &json) {
   auto *a = new Action{type, json};
-  if (xQueueSend(actions, &a, 0) != pdTRUE)
+  if (xQueueSend(actions, &a, 0) != pdTRUE) {
+    std::fill(a->json.begin(), a->json.end(), 0);
     delete a;
+    return false;
+  }
+  return true;
 }
 static Config config_copy() {
   std::lock_guard<std::mutex> g(model.mutex);
@@ -82,13 +97,19 @@ static void wifi_event(void *, esp_event_base_t base, int32_t id, void *data) {
       model.ip = ip;
     }
     xEventGroupSetBits(wifi_events, GOT_IP);
+  } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+    associated = true;
   } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    associated = false;
     connected = false;
     reason = static_cast<wifi_event_sta_disconnected_t *>(data)->reason;
     xEventGroupSetBits(wifi_events, LOST_IP);
   }
 }
 static bool connect_profile(const Profile &p) {
+  connection_error = "connection_failed";
+  associated = connected = false;
+  reason = 0;
   esp_wifi_disconnect();
   vTaskDelay(pdMS_TO_TICKS(100));
   xEventGroupClearBits(wifi_events, GOT_IP | LOST_IP);
@@ -103,8 +124,10 @@ static bool connect_profile(const Profile &p) {
   w.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
   auto err = esp_wifi_set_config(WIFI_IF_STA, &w);
   std::memset(&w, 0, sizeof(w));
-  if (err != ESP_OK || esp_wifi_connect() != ESP_OK)
+  if (err != ESP_OK || esp_wifi_connect() != ESP_OK) {
+    connection_error = "connect_start_failed";
     return false;
+  }
   int64_t remaining = std::min<int64_t>(12000, deadline - now_ms());
   if (remaining <= 0)
     return false;
@@ -115,6 +138,12 @@ static bool connect_profile(const Profile &p) {
     model.ssid = p.ssid;
     return true;
   }
+  connection_error = reason == WIFI_REASON_AUTH_FAIL ||
+                             reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+                             reason == WIFI_REASON_HANDSHAKE_TIMEOUT
+                         ? "auth_failed"
+                     : reason == WIFI_REASON_NO_AP_FOUND ? "network_not_found"
+                     : associated ? "dhcp_timeout" : "connection_timeout";
   return false;
 }
 static bool ensure_wifi() {
@@ -256,7 +285,7 @@ static int request(const Config &c, const std::string &path, Http &out,
     esp_http_client_config_t h{};
     h.url = url.c_str();
     h.timeout_ms = std::clamp<int64_t>(deadline - now_ms(), 1, local ? 2500 : external_cache_enabled() ? 15000 : 5000);
-    h.user_agent = "Readocs/0.2.7 (PaperDIY; ESP32-S3)";
+    h.user_agent = "Readocs/0.2.8 (PaperDIY; ESP32-S3)";
     h.common_name = http_name.empty() ? nullptr : http_name.c_str();
     h.event_handler = http_event;
     h.disable_auto_redirect = true;
@@ -842,18 +871,42 @@ static bool download_article(const cJSON *input) {
   return true;
 }
 
-void stop_setup() {
+bool stop_setup() {
+  if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK) {
+    error_text = "热点关闭失败，请重试或重启设备";
+    set_status(error_text);
+    return false;
+  }
   {
     std::lock_guard<std::mutex> g(model.mutex);
     model.ap = false;
     model.ap_session.clear();
+    std::fill(model.ap_password.begin(), model.ap_password.end(), 0);
+    model.ap_password.clear();
+    setup_operation.pending = false;
+    setup_operation.close_at = 0;
   }
-  esp_wifi_set_mode(WIFI_MODE_STA);
+  if (!networking) {
+    connected = false;
+    if (esp_wifi_stop() != ESP_OK) {
+      error_text = "热点已关闭，但 Wi-Fi 停止失败，请重启设备";
+      set_status(error_text);
+      return false;
+    }
+  }
   redraw = true;
+  return true;
 }
-void start_setup() {
+bool start_setup(const std::string &password) {
+  if (!password.empty() && (password.size() < 12 || password.size() > 63)) {
+    error_text = "USB 指定热点密码须为 12–63 字节";
+    return false;
+  }
   uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+    error_text = "热点设备标识读取失败";
+    return false;
+  }
   char ssid[32], pass[17], session[33];
   std::snprintf(ssid, sizeof(ssid), "Readocs-%02X%02X", mac[4], mac[5]);
   std::snprintf(pass, sizeof(pass), "%08lx%08lx",
@@ -867,25 +920,54 @@ void start_setup() {
   wifi_config_t ap{};
   std::strcpy(reinterpret_cast<char *>(ap.ap.ssid), ssid);
   std::strcpy(reinterpret_cast<char *>(ap.ap.password), pass);
+  if (!password.empty()) {
+    std::memset(ap.ap.password, 0, sizeof(ap.ap.password));
+    std::memcpy(ap.ap.password, password.data(), password.size());
+  }
   ap.ap.ssid_len = std::strlen(ssid);
   ap.ap.channel = 1;
   ap.ap.max_connection = 2;
   ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
-  esp_wifi_set_mode(WIFI_MODE_APSTA);
-  esp_wifi_set_config(WIFI_IF_AP, &ap);
-  esp_wifi_start();
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    model.ap = false;
+    model.ap_session.clear();
+    setup_operation = {};
+  }
+  auto err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+  if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_AP, &ap);
+  if (err == ESP_OK) err = esp_wifi_start();
+  esp_netif_ip_info_t ip{};
+  bool ready = false;
+  for (unsigned i = 0; err == ESP_OK && i < 40; ++i) {
+    esp_netif_dhcp_status_t dhcp;
+    if (esp_netif_is_netif_up(ap_netif) &&
+        esp_netif_get_ip_info(ap_netif, &ip) == ESP_OK && ip.ip.addr &&
+        esp_netif_dhcps_get_status(ap_netif, &dhcp) == ESP_OK && dhcp == ESP_NETIF_DHCP_STARTED) {
+      ready = true;
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  if (!ready) {
+    const auto restored = esp_wifi_set_mode(WIFI_MODE_STA);
+    ESP_LOGW("readocs-setup", "AP start failed err=%s restore=%s", esp_err_to_name(err), esp_err_to_name(restored));
+    error_text = "热点启动失败，请重试或通过 USB 配网";
+    return false;
+  }
   {
     std::lock_guard<std::mutex> g(model.mutex);
     model.ap_ssid = ssid;
-    model.ap_password = pass;
+    model.ap_password = password.empty() ? pass : password;
     model.ap_session = session;
     model.ap = true;
+    setup_operation.message = "请填写目标 Wi-Fi，连接失败时原配置保留";
   }
   ap_activity = now_ms();
   redraw = true;
+  set_status("请连接屏幕所示热点完成配网");
+  return true;
 }
-static const char PAGE[] =
-    R"HTML(<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Readocs · Wi-Fi</title><style>*{box-sizing:border-box}body{font:16px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:#1c252c;background:#f7f8fa;max-width:440px;padding:32px 24px;margin:20px auto}h1{font-size:28px;margin:40px 0 30px}label{display:block;font-size:14px;margin-top:22px}input,button{font:inherit;width:100%;padding:12px;border:1px solid #d3dde1;border-radius:7px;background:white;margin-top:8px}button{cursor:pointer}button[type=submit]{background:#17766b;color:white;border:0;margin-top:30px}#networks button{text-align:left;background:none;border:0;border-bottom:1px solid #e0e6e9;border-radius:0}details{font-size:13px;margin-top:28px;color:#69777e}#result{font-size:14px}header{font-weight:650;font-size:22px}</style><header>readocs</header><h1>连接 Wi-Fi</h1><div id="networks"></div><button id="scan">扫描网络</button><form id="form"><label for="ssid">Wi-Fi 名称</label><input id="ssid" maxlength="32" required><label for="password">密码</label><input id="password" type="password" maxlength="63" autocomplete="new-password"><div id="replace"></div><button type="submit">连接</button><p id="result" role="status"></p></form><details><summary>已保存的网络</summary><div id="saved"></div></details><details><summary>网络要求</summary><p>使用 2.4 GHz 个人 Wi-Fi 或手机热点。换网络后，阅读内容和飞书配置会保留。</p></details><script>let session='',profiles=[];const $=s=>document.querySelector(s);async function call(path,data){const r=await fetch(path,{method:data?'POST':'GET',headers:data?{'Content-Type':'application/json','X-Setup-Session':session}:{},body:data?JSON.stringify(data):undefined});const j=await r.json();if(!r.ok)throw Error(j.message||'操作失败');return j}async function load(){let s=await call('/api/status');session=s.session;profiles=s.networks;$('#saved').replaceChildren();profiles.forEach(n=>{let b=document.createElement('button');b.type='button';b.textContent=n; b.onclick=async()=>{if(confirm('忘记 '+n+'？')){try{await call('/api/forget',{ssid:n});await load()}catch(e){$('#result').textContent=e.message}}};$('#saved').append(b)})}$('#scan').onclick=async()=>{try{$('#scan').disabled=true;const list=await call('/api/scan');$('#networks').replaceChildren();list.networks.forEach(n=>{let b=document.createElement('button');b.type='button';b.textContent=n.ssid+(n.secure?' · 加密':'');b.onclick=()=>{$('#ssid').value=n.ssid;$('#password').focus()};$('#networks').append(b)})}catch(e){$('#result').textContent=e.message}finally{$('#scan').disabled=false}};$('#form').onsubmit=async e=>{e.preventDefault();let data={ssid:$('#ssid').value,password:$('#password').value};if(profiles.length>=5&&!profiles.includes(data.ssid)){let choice=prompt('已保存 5 个网络，请输入要替换的网络名称：\n'+profiles.join('\n'));if(!profiles.includes(choice))return;data.replace=choice}try{await call('/api/wifi',data);$('#password').value='';$('#result').textContent='正在连接，请查看设备屏幕。连接成功后热点会关闭。'}catch(err){$('#result').textContent=err.message}};load().catch(e=>$('#result').textContent=e.message);</script></html>)HTML";
 static bool on_ap(httpd_req_t *req, const char **denial = nullptr) {
   sockaddr_storage local{};
   socklen_t len = sizeof(local);
@@ -894,6 +976,7 @@ static bool on_ap(httpd_req_t *req, const char **denial = nullptr) {
   {
     std::lock_guard<std::mutex> g(model.mutex);
     if (!model.ap) code = "setup_closed";
+    else if (now_ms() - ap_activity >= 300000) code = "setup_expired";
   }
   if (!code && (esp_netif_get_ip_info(ap_netif, &info) != ESP_OK || !info.ip.addr))
     code = "ap_address_unavailable";
@@ -903,6 +986,16 @@ static bool on_ap(httpd_req_t *req, const char **denial = nullptr) {
   uint32_t ipv4 = 0;
   if (!code) code = setup_ipv4(local, len, ipv4);
   if (!code && ipv4 != info.ip.addr) code = "setup_channel_mismatch";
+  // Also reject a STA/routed peer reaching the AP address through weak-host routing.
+  sockaddr_storage peer{};
+  socklen_t peer_len = sizeof(peer);
+  if (!code && getpeername(httpd_req_to_sockfd(req), reinterpret_cast<sockaddr *>(&peer), &peer_len) != 0)
+    code = "peer_address_unavailable";
+  uint32_t peer_ipv4 = 0;
+  if (!code) code = setup_ipv4(peer, peer_len, peer_ipv4);
+  if (!code && (!info.netmask.addr ||
+      (peer_ipv4 & info.netmask.addr) != (info.ip.addr & info.netmask.addr)))
+    code = "peer_channel_mismatch";
   if (denial) *denial = code;
   if (code)
     ESP_LOGW("readocs-setup", "denied reason=%s family=%d length=%u ipv6=%d",
@@ -922,6 +1015,104 @@ static esp_err_t setup_error(httpd_req_t *req, const char *status,
   cJSON_AddStringToObject(j.get(), "message", message);
   return send_json(req, j.get());
 }
+static void setup_result(const std::string &state, const std::string &code,
+                         const std::string &message, int64_t close_delay = 0) {
+  std::lock_guard<std::mutex> g(model.mutex);
+  setup_operation.state = state;
+  setup_operation.code = code;
+  setup_operation.message = message;
+  setup_operation.pending = false;
+  setup_operation.close_at = model.ap && close_delay ? now_ms() + close_delay : 0;
+}
+static bool setup_failure(const char *code, const char *message) {
+  error_text = message;
+  setup_result("failed", code, message);
+  return false;
+}
+static bool configure_wifi(const cJSON *input) {
+  auto c = config_copy();
+  Profile p{str(input, "ssid"), str(input, "password")};
+  if (p.ssid.empty() || p.ssid.size() > 32 ||
+      (!p.password.empty() && (p.password.size() < 8 || p.password.size() > 63)))
+    return setup_failure("invalid_wifi", "Wi-Fi 名称或密码格式错误");
+  auto it = std::find_if(c.networks.begin(), c.networks.end(),
+                        [&](const Profile &old) { return old.ssid == p.ssid; });
+  if (it == c.networks.end() && c.networks.size() >= 5) {
+    auto replace = str(input, "replace");
+    auto old = std::find_if(c.networks.begin(), c.networks.end(),
+                          [&](const Profile &n) { return n.ssid == replace; });
+    if (old == c.networks.end())
+      return setup_failure("replacement_required", "请选择要替换的已保存网络");
+    c.networks.erase(old);
+  }
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    if (!setup_operation.pending) ++setup_operation.id;
+    setup_operation.pending = true;
+    setup_operation.state = "connecting";
+    setup_operation.kind = "wifi";
+    setup_operation.code.clear();
+    setup_operation.message = "正在连接 Wi-Fi";
+    setup_operation.close_at = 0;
+  }
+  set_status("正在连接 Wi-Fi");
+  if (esp_wifi_start() != ESP_OK)
+    return setup_failure("wifi_start_failed", "Wi-Fi 启动失败，请重试");
+  if (!connect_profile(p)) {
+    esp_wifi_disconnect();
+    {
+      std::lock_guard<std::mutex> g(model.mutex);
+      model.ssid.clear(); model.ip.clear();
+    }
+    const char *message = std::strcmp(connection_error, "auth_failed") == 0
+                              ? "密码错误或认证失败，请修改密码重试"
+                         : std::strcmp(connection_error, "dhcp_timeout") == 0
+                              ? "已关联网络但未取得 IP，请检查路由器 DHCP 后重试"
+                         : std::strcmp(connection_error, "network_not_found") == 0
+                              ? "没有找到该网络，请确认名称、2.4 GHz 信号或隐藏网络设置"
+                              : "连接超时或启动失败，请重试；原网络配置已保留";
+    return setup_failure(connection_error, message);
+  }
+  c.networks.erase(std::remove_if(c.networks.begin(), c.networks.end(),
+                                 [&](const Profile &n) { return n.ssid == p.ssid; }),
+                  c.networks.end());
+  c.networks.insert(c.networks.begin(), p);
+  if (!save_config(c)) {
+    esp_wifi_disconnect(); connected = false;
+    return setup_failure("save_failed", "网络已连接但配置保存失败，原配置保留，请重试");
+  }
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    model.config = c;
+  }
+  setup_result("success", "connected", "Wi-Fi 已连接并保存，热点即将关闭", 20000);
+  set_status("Wi-Fi 已连接并保存");
+  return true;
+}
+static void service_setup() {
+  std::unique_lock<std::mutex> radio(network_radio_mutex, std::try_to_lock);
+  if (!radio.owns_lock()) return;
+  bool close = false;
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    close = model.ap && ((setup_operation.close_at && now_ms() >= setup_operation.close_at) ||
+                         now_ms() - ap_activity >= 300000);
+  }
+  if (close && !stop_setup()) {
+    std::lock_guard<std::mutex> g(model.mutex);
+    setup_operation.close_at = 0;
+    ap_activity = now_ms(); // Avoid repeatedly refreshing the same close failure.
+  }
+}
+static bool setup_action_is_current(const cJSON *input) {
+  auto *marker = cJSON_GetObjectItemCaseSensitive(input, "_setup_session");
+  if (!marker) return true; // Physical USB actions do not use browser sessions.
+  auto session = str(input, "_setup_session");
+  if (session.empty()) return false;
+  std::lock_guard<std::mutex> g(model.mutex);
+  return model.ap && model.ap_session == session &&
+         num(input, "_setup_operation") == static_cast<int>(setup_operation.id);
+}
 static esp_err_t web(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
@@ -929,35 +1120,60 @@ static esp_err_t web(httpd_req_t *req) {
   const char *denial = nullptr;
   if (!on_ap(req, &denial))
     return setup_error(req, "403 Forbidden", denial,
-        std::strcmp(denial, "setup_closed") == 0
+        std::strcmp(denial, "setup_closed") == 0 || std::strcmp(denial, "setup_expired") == 0
             ? "配网会话已关闭，请在设备上重新开启配网"
             : "请重新连接设备屏幕所示热点，再打开 http://192.168.4.1/");
-  ap_activity = now_ms();
-  if (std::strcmp(req->uri, "/") == 0) {
+  std::string path(req->uri);
+  if (path.size() > 512)
+    return setup_error(req, "414 URI Too Long", "uri_too_long", "请求地址过长");
+  path.resize(path.find('?') == std::string::npos ? path.size() : path.find('?'));
+  if (path.size() > 96)
+    return setup_error(req, "414 URI Too Long", "uri_too_long", "请求路径过长");
+  const bool read = path == "/" || path == "/api/status" || path == "/api/scan";
+  const bool write = path == "/api/wifi" || path == "/api/forget" || path == "/api/complete";
+  if (!read && !write)
+    return setup_error(req, "404 Not Found", "not_found", "没有这个配网接口");
+  if ((read && req->method != HTTP_GET) || (write && req->method != HTTP_POST)) {
+    httpd_resp_set_hdr(req, "Allow", read ? "GET" : "POST");
+    return setup_error(req, "405 Method Not Allowed", "method_not_allowed", "请求方法不正确");
+  }
+  if (path == "/") {
+    ap_activity = now_ms();
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_sendstr(req, PAGE);
   }
   if (req->method == HTTP_GET) {
     Json j(cJSON_CreateObject());
-    if (std::strcmp(req->uri, "/api/status") == 0) {
+    if (path == "/api/status") {
       std::lock_guard<std::mutex> g(model.mutex);
       cJSON_AddStringToObject(j.get(), "session", model.ap_session.c_str());
       cJSON_AddStringToObject(j.get(), "status", model.status.c_str());
-    cJSON_AddBoolToObject(j.get(), "sync_pending", model.sync_pending);
-    cJSON_AddBoolToObject(j.get(), "local_proxy_configured", !model.config.local_server.empty());
-    cJSON_AddBoolToObject(j.get(), "local_proxy_fallback", local_proxy_failed.load());
+      cJSON_AddBoolToObject(j.get(), "sync_pending", model.sync_pending);
+      cJSON_AddBoolToObject(j.get(), "local_proxy_configured", !model.config.local_server.empty());
+      cJSON_AddBoolToObject(j.get(), "local_proxy_fallback", local_proxy_failed.load());
+      auto *result = cJSON_AddObjectToObject(j.get(), "connection");
+      cJSON_AddStringToObject(result, "state", setup_operation.state.c_str());
+      cJSON_AddStringToObject(result, "kind", setup_operation.kind.c_str());
+      cJSON_AddStringToObject(result, "code", setup_operation.code.c_str());
+      cJSON_AddStringToObject(result, "message", setup_operation.message.c_str());
+      cJSON_AddNumberToObject(result, "operation", setup_operation.id);
+      cJSON_AddBoolToObject(result, "pending", setup_operation.pending);
       auto *a = cJSON_AddArrayToObject(j.get(), "networks");
       for (const auto &p : model.config.networks)
         cJSON_AddItemToArray(a, cJSON_CreateString(p.ssid.c_str()));
     } else {
+      ap_activity = now_ms();
+      std::unique_lock<std::mutex> radio(network_radio_mutex, std::try_to_lock);
+      bool pending;
+      { std::lock_guard<std::mutex> g(model.mutex); pending = setup_operation.pending; }
       wifi_scan_config_t scan{};
       scan.show_hidden = true;
-      if (networking || esp_wifi_scan_start(&scan, true) != ESP_OK)
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                   "Network busy");
+      if (!radio.owns_lock() || networking || pending || esp_wifi_scan_start(&scan, true) != ESP_OK)
+        return setup_error(req, "409 Conflict", "network_busy", "设备正在联网，请稍后重试扫描");
       wifi_ap_record_t found[20]{};
       uint16_t count = 20;
-      esp_wifi_scan_get_ap_records(&count, found);
+      if (esp_wifi_scan_get_ap_records(&count, found) != ESP_OK)
+        return setup_error(req, "503 Service Unavailable", "scan_failed", "扫描失败，可手动填写网络名称重试");
       auto *a = cJSON_AddArrayToObject(j.get(), "networks");
       for (int i = 0; i < count; ++i) {
         if (!found[i].ssid[0])
@@ -974,34 +1190,78 @@ static esp_err_t web(httpd_req_t *req) {
   char token[40]{};
   if (httpd_req_get_hdr_value_str(req, "X-Setup-Session", token,
                                   sizeof(token)) != ESP_OK)
-    return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Invalid session");
+    return setup_error(req, "403 Forbidden", "invalid_session", "缺少有效配网会话，请刷新页面");
   {
     std::lock_guard<std::mutex> g(model.mutex);
     if (model.ap_session != token)
-      return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Expired session");
+      return setup_error(req, "403 Forbidden", "expired_session", "配网会话已更换，请刷新页面");
   }
   if (req->content_len <= 0 || req->content_len > 512)
-    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid size");
+    return setup_error(req, "400 Bad Request", "invalid_size", "提交内容大小不正确");
   std::string body(req->content_len, '\0');
   size_t used = 0;
   while (used < body.size()) {
     int n = httpd_req_recv(req, body.data() + used, body.size() - used);
     if (n <= 0)
-      return ESP_FAIL;
+      return setup_error(req, "408 Request Timeout", "incomplete_body", "提交未接收完整，请重试");
     used += n;
   }
-  Json j(cJSON_Parse(body.c_str()));
+  Json j(cJSON_ParseWithLengthOpts(body.c_str(), body.size() + 1, nullptr, true));
+  if (!cJSON_IsObject(j.get()) || body.find('\0') != std::string::npos ||
+      body.find("\\u0000") != std::string::npos)
+    return setup_error(req, "400 Bad Request", "invalid_json", "提交格式不正确");
   auto ssid = str(j.get(), "ssid"), pass = str(j.get(), "password");
-  if (ssid.empty() || ssid.size() > 32 ||
+  if (path != "/api/complete" && (ssid.empty() || ssid.size() > 32 ||
       ssid.find('\0') != std::string::npos ||
-      (!pass.empty() && (pass.size() < 8 || pass.size() > 63)))
-    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                               "Invalid Wi-Fi data");
-  enqueue(std::strcmp(req->uri, "/api/forget") == 0 ? "forget" : "wifi", body);
+      (path == "/api/wifi" && !pass.empty() && (pass.size() < 8 || pass.size() > 63))))
+    return setup_error(req, "400 Bad Request", "invalid_wifi", "Wi-Fi 名称或密码格式错误");
+  unsigned operation;
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    if (!model.ap || model.ap_session != token)
+      return setup_error(req, "403 Forbidden", "expired_session", "配网会话已更换，请刷新页面");
+    if (path == "/api/complete") {
+      if (setup_operation.state != "success" || setup_operation.pending)
+        return setup_error(req, "409 Conflict", "not_connected", "尚未确认连接并保存成功");
+      setup_operation.close_at = now_ms() + 1000;
+    } else {
+      if (networking || setup_operation.pending)
+        return setup_error(req, "409 Conflict", "operation_busy", "已有操作正在执行，请等待结果");
+      while (cJSON_GetObjectItemCaseSensitive(j.get(), "_setup_session"))
+        cJSON_DeleteItemFromObjectCaseSensitive(j.get(), "_setup_session");
+      cJSON_AddStringToObject(j.get(), "_setup_session", model.ap_session.c_str());
+      while (cJSON_GetObjectItemCaseSensitive(j.get(), "_setup_operation"))
+        cJSON_DeleteItemFromObjectCaseSensitive(j.get(), "_setup_operation");
+      cJSON_AddNumberToObject(j.get(), "_setup_operation", setup_operation.id + 1);
+      if (!enqueue(path == "/api/forget" ? "forget" : "wifi", serialize(j.get())))
+        return setup_error(req, "503 Service Unavailable", "queue_full", "操作队列已满，请稍后重试");
+      ++setup_operation.id;
+      setup_operation.pending = true;
+      setup_operation.state = "queued";
+      setup_operation.kind = path == "/api/forget" ? "forget" : "wifi";
+      setup_operation.code.clear();
+      setup_operation.message = "操作已接收，正在处理";
+      setup_operation.close_at = 0;
+    }
+    operation = setup_operation.id;
+    ap_activity = now_ms();
+  }
   std::fill(body.begin(), body.end(), 0);
   Json ok(cJSON_CreateObject());
   cJSON_AddBoolToObject(ok.get(), "accepted", true);
+  cJSON_AddNumberToObject(ok.get(), "operation", operation);
   return send_json(req, ok.get());
+}
+static esp_err_t setup_socket_open(httpd_handle_t, int fd) {
+  // lwIP binds the accepted TCP PCB to this netif, before HTTP reads begin.
+  // Local-address checks alone do not identify the incoming interface.
+  struct ifreq interface{};
+  if (esp_netif_get_netif_impl_name(ap_netif, interface.ifr_name) != ESP_OK ||
+      setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, &interface, sizeof(interface)) != 0) {
+    ESP_LOGW("readocs-setup", "setup socket interface binding failed");
+    return ESP_FAIL;
+  }
+  return ESP_OK;
 }
 void init_network() {
   wifi_events = xEventGroupCreate();
@@ -1014,7 +1274,7 @@ void init_network() {
   ESP_ERROR_CHECK(esp_wifi_init(&wc));
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
   ESP_ERROR_CHECK(esp_event_handler_register(
-      WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event, nullptr));
+      WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, nullptr));
   ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                              wifi_event, nullptr));
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -1024,23 +1284,19 @@ void init_network() {
   ESP_LOGI("readocs-setup", "HTTP IPv6=%d", CONFIG_LWIP_IPV6);
   httpd_config_t sc = HTTPD_DEFAULT_CONFIG();
   sc.stack_size = 8192;
-  sc.max_uri_handlers = 6;
+  sc.max_uri_handlers = 1;
+  sc.uri_match_fn = httpd_uri_match_wildcard;
+  sc.open_fn = setup_socket_open;
   ESP_ERROR_CHECK(httpd_start(&server, &sc));
-  for (const char *uri :
-       {"/", "/api/status", "/api/scan", "/api/wifi", "/api/forget"}) {
-    httpd_uri_t h{};
-    h.uri = uri;
-    h.method = std::strcmp(uri, "/api/wifi") == 0 ||
-                       std::strcmp(uri, "/api/forget") == 0
-                   ? HTTP_POST
-                   : HTTP_GET;
-    h.handler = web;
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &h));
-  }
+  httpd_uri_t h{};
+  h.uri = "/*";
+  h.method = static_cast<httpd_method_t>(HTTP_ANY);
+  h.handler = web;
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &h));
 }
 static void status_console() {
   Json j(cJSON_CreateObject());
-  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.7");
+  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.8");
   cJSON_AddStringToObject(j.get(), "font_family", "Noto Sans SC");
   cJSON_AddNumberToObject(j.get(), "font_weight", reader_font_weight);
   cJSON_AddBoolToObject(j.get(), "fonts_ready", reader_fonts_ready());
@@ -1070,6 +1326,12 @@ static void status_console() {
   {
     std::lock_guard<std::mutex> g(model.mutex);
     cJSON_AddStringToObject(j.get(), "status", model.status.c_str());
+    cJSON_AddBoolToObject(j.get(), "setup_active", model.ap);
+    cJSON_AddBoolToObject(j.get(), "setup_ipv6", CONFIG_LWIP_IPV6);
+    cJSON_AddStringToObject(j.get(), "setup_state", setup_operation.state.c_str());
+    cJSON_AddStringToObject(j.get(), "setup_code", setup_operation.code.c_str());
+    cJSON_AddNumberToObject(j.get(), "setup_operation", setup_operation.id);
+    cJSON_AddBoolToObject(j.get(), "setup_pending", setup_operation.pending);
     cJSON_AddBoolToObject(j.get(), "sync_pending", model.sync_pending);
     cJSON_AddBoolToObject(j.get(), "local_proxy_configured", !model.config.local_server.empty());
     cJSON_AddBoolToObject(j.get(), "local_proxy_fallback", local_proxy_failed.load());
@@ -1201,9 +1463,9 @@ void console_task(void *) {
     } else if (cmd == "reboot")
       esp_restart();
     else if (cmd == "setup" || cmd == "wifi" || cmd == "bind" ||
-             cmd == "check" || cmd == "forget" || cmd == "local_proxy") {
-      enqueue(cmd, line);
-      std::printf("ACCEPTED %s\n", cmd.c_str());
+             cmd == "check" || cmd == "forget" || cmd == "local_proxy" || cmd == "setup_cancel") {
+      if (enqueue(cmd, line)) std::printf("ACCEPTED %s\n", cmd.c_str());
+      else std::printf("RESULT {\"command\":\"%s\",\"ok\":false,\"code\":\"queue_full\"}\n", cmd.c_str());
     } else
       std::printf("ERROR invalid command\n");
     std::fill(line.begin(), line.end(), 0);
@@ -1213,15 +1475,9 @@ void console_task(void *) {
 }
 void network_task(void *) {
   while (true) {
+    service_setup();
     Action *ptr = nullptr;
     if (xQueueReceive(actions, &ptr, pdMS_TO_TICKS(1000)) != pdTRUE) {
-      bool ap;
-      {
-        std::lock_guard<std::mutex> g(model.mutex);
-        ap = model.ap;
-      }
-      if (ap && now_ms() - ap_activity > 300000)
-        stop_setup();
       continue;
     }
     std::unique_ptr<Action> action(ptr);
@@ -1231,6 +1487,7 @@ void network_task(void *) {
       // starting Wi-Fi, TLS, filesystem, or HTTP operations.
       std::lock_guard<std::mutex> awake(ui_sleep_mutex);
     }
+    std::unique_lock<std::mutex> radio(network_radio_mutex);
     deadline = now_ms() + (external_cache_enabled() &&
         (action->type == "sync" || action->type == "check") ? 120000 :
         action->type == "download" ? 60000 : 20000);
@@ -1247,56 +1504,18 @@ void network_task(void *) {
     bool ok = true;
     Json input(cJSON_Parse(action->json.c_str()));
     auto c = config_copy();
-    if (action->type == "setup")
-      start_setup();
-    else if (action->type == "wifi") {
-      Profile p{str(input.get(), "ssid"), str(input.get(), "password")};
-      auto it =
-          std::find_if(c.networks.begin(), c.networks.end(),
-                       [&](const Profile &old) { return old.ssid == p.ssid; });
-      if (p.ssid.empty() || p.ssid.size() > 32 ||
-          (!p.password.empty() &&
-           (p.password.size() < 8 || p.password.size() > 63))) {
-        ok = false;
-        error_text = "Wi-Fi 名称或密码格式错误";
-      } else if (it == c.networks.end() && c.networks.size() >= 5) {
-        auto replace = str(input.get(), "replace");
-        auto old =
-            std::find_if(c.networks.begin(), c.networks.end(),
-                         [&](const Profile &n) { return n.ssid == replace; });
-        if (old == c.networks.end()) {
-          ok = false;
-          error_text = "请选择要替换的已保存网络";
-        } else
-          c.networks.erase(old);
-      }
-      if (ok) {
-        set_status("正在连接 Wi-Fi");
-        esp_wifi_start();
-        ok = connect_profile(p);
-        if (ok) {
-          c.networks.erase(std::remove_if(c.networks.begin(), c.networks.end(),
-                                          [&](const Profile &n) {
-                                            return n.ssid == p.ssid;
-                                          }),
-                           c.networks.end());
-          c.networks.insert(c.networks.begin(), p);
-          ok = save_config(c);
-          if (ok) {
-            {
-              std::lock_guard<std::mutex> g(model.mutex);
-              model.config = c;
-            }
-            stop_setup();
-            set_status("Wi-Fi 已连接");
-          }
-        } else
-          error_text = reason == WIFI_REASON_AUTH_FAIL ||
-                               reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT
-                           ? "密码错误，请重试"
-                           : "连接失败，原网络配置已保留";
-      }
-    } else if (action->type == "forget") {
+    if (!setup_action_is_current(input.get())) {
+      ok = false;
+      error_text = "配网会话已更换，操作未执行";
+    } else if (action->type == "setup")
+      ok = start_setup(str(input.get(), "password"));
+    else if (action->type == "setup_cancel") {
+      ok = stop_setup();
+      if (ok) set_status("配网热点已关闭");
+    }
+    else if (action->type == "wifi")
+      ok = configure_wifi(input.get());
+    else if (action->type == "forget") {
       auto ssid = str(input.get(), "ssid");
       c.networks.erase(
           std::remove_if(c.networks.begin(), c.networks.end(),
@@ -1311,7 +1530,11 @@ void network_task(void *) {
           model.ssid.clear();
         }
       }
-      set_status("网络已忘记");
+      if (ok) {
+        setup_result("idle", "network_forgotten", "网络已忘记");
+        set_status("网络已忘记");
+      } else
+        ok = setup_failure("save_failed", "忘记网络时保存失败，原配置已保留");
     } else if (action->type == "bind") {
       auto server = str(input.get(), "server"), ca = str(input.get(), "ca"),
            code = str(input.get(), "code");

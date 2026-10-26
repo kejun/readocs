@@ -116,7 +116,7 @@ struct Position {
 extern Position position;
 int64_t now_ms();
 void set_status(const std::string &s, bool visible = true);
-void enqueue(const std::string &type, const std::string &json = "");
+bool enqueue(const std::string &type, const std::string &json = "");
 std::string sha256(const std::string &s);
 bool valid_hash(const std::string &s);
 std::string read_file(const std::string &name, size_t limit = 310 * 1024);
@@ -154,6 +154,6 @@ void request_quality_cleanup();
 int display_partial_count();
 int display_partial_limit();
 void set_display_partial_limit(int limit);
-void start_setup();
-void stop_setup();
+bool start_setup(const std::string &password = "");
+bool stop_setup();
 } // namespace rd

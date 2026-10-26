@@ -398,8 +398,9 @@ extern "C" void app_main() {
         // Require all keys to be released after the combination before
         // accepting a fresh confirmation.
         if (event == Key::Previous) {
-          enqueue("setup");
-          view = View::Sources;
+          if (!enqueue("setup"))
+            set_status("操作队列已满，请稍后重试");
+          view = View::Status;
         } else if (event == Key::Next || event == Key::Menu)
           view = View::Sources;
         need_draw = true;

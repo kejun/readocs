@@ -9,14 +9,18 @@ import time
 from pathlib import Path
 
 import serial
+from serial.tools import list_ports
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=["status", "setup", "wifi", "bind", "check", "forget"]
+        "command",
+        choices=["status", "setup", "setup-cancel", "wifi", "bind", "check", "forget"],
     )
-    parser.add_argument("--port", default="/dev/cu.usbmodem101")
+    parser.add_argument(
+        "--port", help="USB serial port; auto-detect PaperDIY when omitted"
+    )
     parser.add_argument("--ssid")
     parser.add_argument(
         "--replace",
@@ -29,6 +33,16 @@ def main():
         "--ca", type=Path, help="Local proxy public TLS certificate (.readocs/tls.crt)"
     )
     args = parser.parse_args()
+    args.command = args.command.replace("-", "_")
+    if not args.port:
+        ports = [
+            p.device
+            for p in list_ports.comports()
+            if p.vid == 0x303A and p.pid == 0x1001
+        ]
+        if len(ports) != 1:
+            parser.error("未找到唯一的 PaperDIY USB 串口，请连接设备或用 --port 指定")
+        args.port = ports[0]
     payload = {"cmd": args.command}
     if args.command in ("wifi", "forget"):
         payload["ssid"] = args.ssid or input("Wi-Fi 名称：")
@@ -49,9 +63,9 @@ def main():
             port.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
             port.flush()
             payload.clear()
-            # A command can queue behind a 60-second article download, then
-            # use its own 20-second network budget. Allow USB scheduling too.
-            deadline = time.monotonic() + 90
+            # SD sync can use 120 seconds before this operation starts.
+            # Leave time for Wi-Fi association/DHCP and USB scheduling too.
+            deadline = time.monotonic() + 180
             while time.monotonic() < deadline:
                 line = port.readline().decode("utf-8", errors="replace").strip()
                 if line.startswith("ERROR "):
@@ -81,7 +95,7 @@ def main():
                 if kind == "RESULT" and not result["ok"]:
                     sys.exit(1)
                 return
-            sys.exit("设备未在 90 秒内返回结果，请查看屏幕或检查串口占用。")
+            sys.exit("设备未在 180 秒内返回结果，请查看屏幕或检查串口占用。")
     except serial.SerialException:
         sys.exit("USB 连接失败或串口被占用，请关闭其他串口监视器后重试。")
 
