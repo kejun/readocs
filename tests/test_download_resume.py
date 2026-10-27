@@ -18,8 +18,8 @@ def test_actual_ui_catalog_resumes_download_during_next_network_action(tmp_path)
         )[0]
     )
     repaint = (
-        "if (changed && (view == View::Status || ap ||"
-        + source.split("if (changed && (view == View::Status || ap ||", 1)[1].split(
+        "if (changed && (view == View::Status ||"
+        + source.split("if (changed && (view == View::Status ||", 1)[1].split(
             "    if (view == View::Reading && !current.document_id.empty()", 1
         )[0]
     )
@@ -50,7 +50,7 @@ struct Model {
   std::vector<Entry> entries;
   std::vector<Source> sources;
   std::string status, ssid, ap_ssid, ap_password;
-  bool ap = false, sync_pending = false;
+  bool ap = false, sync_pending = false, check_notice = false, last_network_ok = true;
   Config config;
 } model;
 int main() {
@@ -76,6 +76,7 @@ int main() {
 """
     middle = r"""
     (void)sync_pending;
+    (void)network_ok;
     if (publish_after_snapshot) {
       model.entries[1].snapshot_id = "downloaded";
       redraw = true;
@@ -115,6 +116,10 @@ int main() {
   ui_tick(false);
   assert(opens == 2 && current.snapshot_id == "third-version" && networking);
   assert(refreshes >= 3);
+  view=View::Sources;need_draw=false;redraw=true;
+  ui_tick(false);assert(!need_draw); // Passive checks do not expose a footer.
+  model.check_notice=true;redraw=true;
+  ui_tick(false);assert(need_draw); // Manual checks paint their current status.
 }
 """
     cpp = tmp_path / "download-resume.cpp"

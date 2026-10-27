@@ -34,6 +34,7 @@ static int articles_selected = -1;
 static int articles_start = -1;
 static bool sources_valid = false;
 static std::string sources_signature;
+static std::string sources_status;
 static int sources_selected = -1, sources_start = -1;
 static bool page_valid = false;
 static std::string page_source, page_document, page_snapshot, page_title;
@@ -470,8 +471,26 @@ static void draw_source_row(const std::vector<Source> &sources, int selected,
   d.setTextColor(TFT_BLACK, TFT_WHITE);
 }
 
-void draw_sources(const std::vector<Source> &sources, int selected) {
+static std::string source_status_line(std::string status) {
+  font(16);
+  while (!status.empty() && text_width(status.c_str()) > 476)
+    status.resize(last_text_cluster(status, reader_emoji_map()));
+  return status;
+}
+
+static void draw_source_status(const std::string &status) {
   auto &d = M5.Display;
+  d.fillRect(24, 824, 492, 40, TFT_WHITE);
+  d.setTextColor(TFT_BLACK, TFT_WHITE);
+  font(16);
+  d.setCursor(32, 836);
+  print_text(status.c_str());
+}
+
+void draw_sources(const std::vector<Source> &sources, int selected,
+                  const std::string &status) {
+  auto &d = M5.Display;
+  const auto status_line = source_status_line(status);
   std::string signature;
   for (const auto &source : sources)
     signature += source.id + '\x1f' + source.title + '\x1f' +
@@ -480,19 +499,25 @@ void draw_sources(const std::vector<Source> &sources, int selected) {
                              : std::clamp(selected, 0, static_cast<int>(sources.size()) - 1);
   const int start = selected / article_page_size * article_page_size;
   if (sources_valid && signature == sources_signature && start == sources_start) {
-    if (selected == sources_selected)
+    const bool moved = selected != sources_selected;
+    const bool status_changed = status_line != sources_status;
+    if (!moved && !status_changed)
       return;
     const int old_y = 120 + (sources_selected - start) * 88;
     const int new_y = 120 + (selected - start) * 88;
-    const int top = std::min(old_y, new_y) - 8;
-    const int bottom = std::max(old_y, new_y) + 72;
+    const int top = moved ? std::min(old_y, new_y) - 8 : 824;
+    const int bottom = status_changed ? 864 : std::max(old_y, new_y) + 72;
     d.setEpdMode(kPartialMode);
     d.setClipRect(24, top, 492, bottom - top);
-    draw_source_row(sources, selected, sources_selected, old_y);
-    draw_source_row(sources, selected, selected, new_y);
+    if (moved) {
+      draw_source_row(sources, selected, sources_selected, old_y);
+      draw_source_row(sources, selected, selected, new_y);
+    }
+    if (status_changed) draw_source_status(status_line);
     d.clearClipRect();
     finish_partial(24, top, 492, bottom - top);
     sources_selected = selected;
+    sources_status = status_line;
     return;
   }
   begin();
@@ -508,6 +533,7 @@ void draw_sources(const std::vector<Source> &sources, int selected) {
     for (int i = start;
          i < std::min(start + article_page_size, static_cast<int>(sources.size())); ++i)
       draw_source_row(sources, selected, i, 120 + (i - start) * 88);
+  draw_source_status(status_line);
   font(16);
   d.setCursor(32, 880);
   print_text("A 下一来源    A+B 上一来源    B 进入");
@@ -516,6 +542,7 @@ void draw_sources(const std::vector<Source> &sources, int selected) {
   finish();
   sources_valid = true;
   sources_signature = signature;
+  sources_status = status_line;
   sources_selected = selected;
   sources_start = start;
 }

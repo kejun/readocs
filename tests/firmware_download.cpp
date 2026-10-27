@@ -19,6 +19,7 @@ struct Model {
   std::vector<Entry> entries;
   std::vector<Source> sources;
   std::string etag;
+  bool check_queued = false;
 } model;
 static std::string error_text, visible_status, body;
 static std::vector<std::string> stages, parts;

@@ -54,6 +54,8 @@ def test_actual_reader_keeps_fast_partial_refresh(tmp_path):
         "static void draw_menu_row(",
         "static std::string fit_header(",
         "static void draw_source_row(",
+        "static std::string source_status_line(",
+        "static void draw_source_status(",
         "void draw_sources(",
         "void draw_articles(",
         "void draw_menu(",
@@ -66,7 +68,11 @@ def test_actual_reader_keeps_fast_partial_refresh(tmp_path):
             else tail.index("\n}\n") + 2
         )
         functions.append(marker + tail[:end] + "\n")
-    (tmp_path / "refresh_under_test.hpp").write_text(globals_ + "\n".join(functions))
+    (tmp_path / "refresh_under_test.hpp").write_text(
+        globals_
+        + 'void draw_sources(const std::vector<Source>&, int, const std::string& = "");\n'
+        + "\n".join(functions)
+    )
     cc = shutil.which("clang") or shutil.which("gcc")
     cxx = shutil.which("clang++") or shutil.which("g++")
     assert cc and cxx

@@ -373,6 +373,106 @@ class Store:
             )
         return jid
 
+    def refresh_all(self):
+        targets = {
+            row["id"]: row["generation"]
+            for row in self.rows("SELECT id,generation FROM sources ORDER BY id")
+        }
+        previous = self.get("device_refresh")
+        progress = self.refresh_progress()
+        if (
+            previous
+            and previous["targets"] == targets
+            and progress["state"] == "running"
+        ):
+            # Join the current whole-library pass without resetting every
+            # already-checked document to due=0 on each device button press.
+            return {"refresh_id": previous["id"], "job_ids": previous["job_ids"]}
+        record = {
+            "id": secrets.token_hex(12),
+            "started": time.time(),
+            "targets": targets,
+            "job_ids": [self.enqueue(sid, refresh=True) for sid in targets],
+        }
+        self.put("device_refresh", record)
+        return {"refresh_id": record["id"], "job_ids": record["job_ids"]}
+
+    def refresh_progress(self, refresh_id=""):
+        record = self.get("device_refresh")
+        if not record:
+            return {"id": refresh_id, "state": "superseded"} if refresh_id else None
+        if refresh_id and refresh_id != record["id"]:
+            return {"id": refresh_id, "state": "superseded"}
+        if "result" in record:
+            return record["result"]
+        results, total_docs, pending_docs = [], 0, 0
+        for sid, generation in record["targets"].items():
+            source = self.source(sid)
+            if not source or source["generation"] != generation:
+                results.append({"id": sid, "pending": False, "error": "SOURCE_CHANGED"})
+                continue
+            checked = (
+                source["checked"] is not None and source["checked"] >= record["started"]
+            )
+            pending = not checked or bool(
+                self.db.execute(
+                    "SELECT 1 FROM jobs WHERE source_id=?", (sid,)
+                ).fetchone()
+            )
+            # Permanent/auth failures settle this pass; transient failures
+            # keep their existing bounded backoff without reporting success.
+            blocked = checked and source["error"] not in (None, "SOURCE_PARTIAL")
+            retrying = (
+                blocked
+                and source["error"]
+                in ("UPSTREAM_TIMEOUT", "RATE_LIMITED", "REVISION_CHANGED")
+                and source["failures"] < 6
+            )
+            pending = pending or retrying
+            if source["kind"] == "feishu":
+                total, remaining = self.db.execute(
+                    "SELECT COUNT(*),COALESCE(SUM(due=0 OR "
+                    "(error IN ('UPSTREAM_TIMEOUT','RATE_LIMITED','REVISION_CHANGED') "
+                    "AND failures<6)),0) FROM feishu_items"
+                ).fetchone()
+                scan = self.get("feishu_scan")
+                scanning = not scan or not scan["finished"] or scan["next"] == 0
+                if not blocked:
+                    pending = pending or scanning or remaining > 0
+                total_docs += total
+                pending_docs += remaining
+            results.append(
+                {
+                    "id": sid,
+                    "pending": pending,
+                    "error": source["error"] if checked else None,
+                }
+            )
+        state = (
+            "running"
+            if any(s["pending"] for s in results)
+            else ("partial" if any(s["error"] for s in results) else "completed")
+        )
+        if time.time() - record["started"] > 7200 and state == "running":
+            state = "expired"
+        result = {
+            "id": record["id"],
+            "state": state,
+            "total_sources": len(results),
+            "completed_sources": sum(not s["pending"] for s in results),
+            "failed_sources": sum(
+                bool(s["error"]) and not s["pending"] for s in results
+            ),
+            "total_documents": total_docs,
+            "processed_documents": total_docs - pending_docs,
+            "sources": results,
+        }
+        if state != "running":
+            # Freeze the outcome: later periodic/admin refreshes cannot reopen
+            # a device request which already finished.
+            self.put("device_refresh", {**record, "result": result})
+        return result
+
     def prune(self, sid):
         # Keep full bodies for the complete retained directory, including SD clients.
         # Disappearance from a feed is not immediate deletion.

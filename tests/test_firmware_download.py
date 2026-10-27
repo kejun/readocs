@@ -50,7 +50,7 @@ def test_actual_download_validation_and_error_preservation(tmp_path):
                 "static bool download(",
                 "static bool safe_id(",
                 "static bool fetch_entry(",
-                "static void repair_external_entries(",
+                "static bool repair_external_entries(",
                 "static bool download_article(",
             )
         )

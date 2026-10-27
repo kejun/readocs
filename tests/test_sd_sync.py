@@ -46,7 +46,9 @@ def test_actual_full_sd_sync_resumes_without_starving_later_articles(tmp_path):
         "static bool save_directory_progress(",
         "static void compact_directory_progress(",
         "static bool fetch_entry(",
-        "static void repair_external_entries(",
+        "static bool repair_external_entries(",
+        "static bool refresh_sources(",
+        "static void sync_status(",
         "static bool sync(",
     )
     (tmp_path / "sd_sync_under_test.hpp").write_text(

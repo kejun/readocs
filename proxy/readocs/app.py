@@ -655,23 +655,18 @@ def create_app(directory=None, network=None, background=True, device_prefix=""):
             )
         return {
             "schema_version": 1,
-            "job_ids": [
-                store.enqueue(s["id"], refresh=True)
-                for s in store.rows(
-                    "SELECT id FROM sources WHERE due<=? OR error IS NULL",
-                    (time.time(),),
-                )
-            ],
+            **store.refresh_all(),
         }
 
     @app.get("/v1/status")
-    async def status(d: Annotated[dict, Depends(device)]):
+    async def status(d: Annotated[dict, Depends(device)], refresh_id: str = ""):
         return {
             "schema_version": 1,
             "sources": store.rows(
                 "SELECT id,checked,fetched,error FROM sources ORDER BY id"
             ),
             "pending": store.db.execute("SELECT count(*) FROM jobs").fetchone()[0],
+            "refresh": store.refresh_progress(refresh_id),
         }
 
     if device_prefix:

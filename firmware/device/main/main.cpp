@@ -296,7 +296,6 @@ extern "C" void app_main() {
   bool need_draw = cold || !restored_source || interrupted_display;
   std::string last_status;
   bool previous_busy = false, ap_was = false;
-  int64_t last_check = 0;
   while (true) {
     const bool changed = redraw.exchange(false);
     if (power_off_requested.exchange(false)) {
@@ -307,7 +306,7 @@ extern "C" void app_main() {
       need_draw = true;
     run_light_sleep_probe();
     std::string status, ssid, ap_ssid, ap_password;
-    bool ap, sync_pending;
+    bool ap, sync_pending, check_notice, network_ok;
     bool catalog_changed = false, selected_source_preserved = true;
     Config config;
     {
@@ -322,6 +321,8 @@ extern "C" void app_main() {
       ssid = model.ssid;
       ap = model.ap;
       sync_pending = model.sync_pending;
+      check_notice = model.check_notice;
+      network_ok = model.last_network_ok;
       ap_ssid = model.ap_ssid;
       ap_password = model.ap_password;
       config = model.config;
@@ -360,7 +361,7 @@ extern "C" void app_main() {
                                    : (pm1_vbus_voltage() > 4000
                                           ? 300
                                           : config.interval));
-      if (status == "已同步" || sync_pending)
+      if (network_ok)
         failure_count = 0;
       else
         ++failure_count;
@@ -412,10 +413,8 @@ extern "C" void app_main() {
           need_draw = true;
           continue;
         }
-        if (now_ms() - last_check >= 30000 || !last_check) {
-          enqueue("check");
-          last_check = now_ms();
-        }
+        request_check_update();
+        need_draw = true;
         continue;
       }
       if (view == View::Reading) {
@@ -447,8 +446,8 @@ extern "C" void app_main() {
           if (selected == 0) {
             view = View::Sources;
           } else if (selected == 1) {
-            enqueue("check");
-            view = View::Status;
+            request_check_update();
+            view = View::Sources;
           } else if (selected == 2)
             view = View::Status;
           else if (selected == 3) {
@@ -533,7 +532,11 @@ extern "C" void app_main() {
         need_draw = true;
       }
     }
-    if (changed && (view == View::Status || ap ||
+    // Manual checks expose status on the source page. Passive/background work
+    // still cannot make a reading page or unchanged source list flash.
+    { std::lock_guard<std::mutex> g(model.mutex);
+      status = model.status; check_notice = model.check_notice; }
+    if (changed && (view == View::Status || (view == View::Sources && check_notice) || ap ||
                     (view == View::Reading && pages.empty())))
       need_draw = true;
     if (view == View::Reading && !current.document_id.empty() &&
@@ -568,7 +571,7 @@ extern "C" void app_main() {
                    "关机"},
                   selected, "菜单");
       else if (view == View::Sources) {
-        draw_sources(sources, browser.index());
+        draw_sources(sources, browser.index(), check_notice ? status : "");
         browser.source_rendered();
         if (browser.source_input_fenced())
           discard_invalid_source_backlog();

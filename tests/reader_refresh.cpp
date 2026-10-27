@@ -109,6 +109,18 @@ int main() {
   draw_sources(sources,1); expect_last(fast,{24,112,492,168});
   assert(d.fills==fills);
   n=d.frames.size(); draw_sources(sources,1); assert(d.frames.size()==n);
+  auto source_pixels=d.pixels;
+  draw_sources(sources,1,"Checking all sources"); expect_last(fast,{24,824,492,40});
+  assert(d.fills==fills && same(d.frames.back().requested,{24,824,492,40}));
+  assert(std::equal(source_pixels.begin(),source_pixels.begin()+540*824,d.pixels.begin()));
+  n=d.frames.size(); draw_sources(sources,1,"Checking all sources"); assert(d.frames.size()==n);
+  draw_sources(sources,0,"Checking all sources"); expect_last(fast,{24,112,492,168});
+  draw_sources(sources,0,"Synced"); expect_last(fast,{24,824,492,40});
+  assert(d.fills==fills);
+  // Invisible suffix changes must not redraw an already truncated footer.
+  draw_sources(sources,0,std::string(100,'x'));
+  n=d.frames.size(); draw_sources(sources,0,std::string(100,'x')+"hidden");
+  assert(d.frames.size()==n);
   std::vector<Entry> entries;
   for(int i=0;i<16;++i) entries.push_back({"feed",std::to_string(i),"Article "+std::to_string(i),i==0?"body":""});
   draw_articles(entries,0,"RSS",16); expect_last(full,whole);

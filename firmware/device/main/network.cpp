@@ -67,6 +67,30 @@ bool enqueue(const std::string &type, const std::string &json) {
   }
   return true;
 }
+bool request_check_update() {
+  const auto now = now_ms();
+  bool duplicate;
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    duplicate = model.last_check_ms >= 0 && now - model.last_check_ms < 30000;
+    model.check_notice = true;
+    model.status = duplicate ? "刚刚已提交检查，请稍候" :
+        model.refresh_id.empty() ? "已排队：同步所有来源" : "正在继续同步所有来源";
+    if (!duplicate) {
+      model.last_check_ms = now;
+      model.check_queued = true;
+    }
+  }
+  redraw = true;
+  if (duplicate || enqueue("check")) return true;
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    model.last_check_ms = -1;
+    model.check_queued = false;
+  }
+  set_status("操作队列已满，请稍后重试");
+  return false;
+}
 static Config config_copy() {
   std::lock_guard<std::mutex> g(model.mutex);
   return model.config;
@@ -285,7 +309,7 @@ static int request(const Config &c, const std::string &path, Http &out,
     esp_http_client_config_t h{};
     h.url = url.c_str();
     h.timeout_ms = std::clamp<int64_t>(deadline - now_ms(), 1, local ? 2500 : external_cache_enabled() ? 15000 : 5000);
-    h.user_agent = "Readocs/0.2.8 (PaperDIY; ESP32-S3)";
+    h.user_agent = "Readocs/0.2.9 (PaperDIY; ESP32-S3)";
     h.common_name = http_name.empty() ? nullptr : http_name.c_str();
     h.event_handler = http_event;
     h.disable_auto_redirect = true;
@@ -528,15 +552,92 @@ static bool fetch_entry(const Config &c, Entry &entry) {
   entry.snapshot_id = entry.target_snapshot_id = id;
   return true;
 }
-static void repair_external_entries(std::vector<Entry> &entries) {
-  if (!external_cache_enabled()) return;
+static bool repair_external_entries(std::vector<Entry> &entries, bool yield_to_check = false) {
+  if (!external_cache_enabled()) return true;
   // Verify once in the network task, rather than reading every document on
   // each key wake. Missing/damaged card objects are fetched again, and must
   // not prevent an unrelated verified batch from committing.
-  for (auto &entry : entries)
+  for (auto &entry : entries) {
+    if (yield_to_check) {
+      std::lock_guard<std::mutex> g(model.mutex);
+      if (model.check_queued) return false;
+    }
     if (!entry.snapshot_id.empty() && !cache_body_verified(entry.snapshot_id) &&
         sha256(read_file(entry.snapshot_id)) != entry.snapshot_id)
       entry.snapshot_id.clear();
+  }
+  return true;
+}
+static bool refresh_sources(const Config &c, bool manual) {
+  std::string id;
+  { std::lock_guard<std::mutex> g(model.mutex); id = model.refresh_id; }
+  if (manual && id.empty()) {
+    set_status("正在触发所有来源更新");
+    Http out{{}, {}, 4096};
+    // POST is deliberately sent once. A lost response is not replayed.
+    if (request(c, "/v1/refresh", out, "{}") != 202) return false;
+    Json reply(cJSON_Parse(out.body.c_str()));
+    id = str(reply.get(), "refresh_id");
+    if (id.empty() || id.size() > 64 ||
+        id.find_first_not_of("0123456789abcdef") != std::string::npos) {
+      error_text = "代理未返回更新进度，请更新代理";
+      return false;
+    }
+    if (!save_refresh_request(id)) {
+      error_text = "更新已提交，但进度保存失败";
+      return false;
+    }
+    std::lock_guard<std::mutex> g(model.mutex);
+    model.refresh_id = id;
+    model.refresh_waiting = model.sync_pending = model.check_notice = true;
+  }
+  if (id.empty()) return true;
+  Http out{{}, {}, 8192};
+  if (request(c, "/v1/status?refresh_id=" + id, out) != 200) return false;
+  Json reply(cJSON_Parse(out.body.c_str()));
+  auto *progress = cJSON_GetObjectItemCaseSensitive(reply.get(), "refresh");
+  const auto state = str(progress, "state");
+  if (num(reply.get(), "schema_version") != 1 || str(progress, "id") != id ||
+      (state != "running" && state != "completed" && state != "partial" &&
+       state != "expired" && state != "superseded")) {
+    error_text = "代理更新进度无效，旧内容已保留";
+    return false;
+  }
+  const bool waiting = state == "running";
+  if (!waiting && !save_refresh_request("")) {
+    error_text = "更新进度保存失败，请稍后再试";
+    return false;
+  }
+  std::string message;
+  if (waiting) {
+    message = "来源更新 " + std::to_string(num(progress, "completed_sources")) +
+        "/" + std::to_string(num(progress, "total_sources"));
+    if (num(progress, "total_documents") > 0)
+      message += "，正文 " + std::to_string(num(progress, "processed_documents")) +
+          "/" + std::to_string(num(progress, "total_documents"));
+  } else if (state == "partial")
+    message = "部分来源更新失败，已保留可用内容";
+  else if (state != "completed")
+    message = "来源更新未完成，请重新检查";
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    model.refresh_waiting = waiting;
+    model.refresh_failed = state != "running" && state != "completed";
+    model.refresh_message = message;
+    if (!waiting) model.refresh_id.clear();
+    if (waiting) model.sync_pending = true;
+  }
+  set_status(message.empty() ? "正在同步内容到终端" : message);
+  return true;
+}
+static void sync_status() {
+  std::string message;
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    message = model.refresh_waiting || model.refresh_failed ? model.refresh_message :
+        model.sync_pending ? "正文下载中，将自动接续" : "已同步";
+  }
+  set_status(message);
 }
 static bool sync(bool manual) {
   auto c = config_copy();
@@ -546,6 +647,12 @@ static bool sync(bool manual) {
   }
   if (!ensure_wifi() || !ensure_time())
     return false;
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    if (!manual && model.check_queued) return true;
+  }
+  // Start upstream discovery/fetches before any manifest or SD prefetch work.
+  if (!refresh_sources(c, manual)) return false;
   std::string etag;
   std::vector<Entry> old;
   std::vector<Source> old_sources;
@@ -555,7 +662,9 @@ static bool sync(bool manual) {
     old = model.entries;
     old_sources = model.sources;
   }
-  repair_external_entries(old);
+  // An explicit check may arrive during a cold-boot SD integrity walk.
+  // Yield between files so its POST is not stranded behind the whole card.
+  if (!repair_external_entries(old, !manual)) return true;
   const auto selected = current_article();
   if (!compact_cache_for_download(
           old, selected.first, selected.second,
@@ -670,7 +779,7 @@ static bool sync(bool manual) {
           std::lock_guard<std::mutex> g(model.mutex);
           model.sync_pending = true;
         }
-        set_status("目录同步中，下次检查接续");
+        set_status("目录同步中，将自动接续");
         return true;
       }
       auto *source = cJSON_GetArrayItem(sources, source_index);
@@ -774,7 +883,7 @@ static bool sync(bool manual) {
       return false;
     {
       std::lock_guard<std::mutex> g(model.mutex);
-      model.sync_pending = !complete && !storage_full;
+      model.sync_pending = (!complete && !storage_full) || model.refresh_waiting;
     }
     collect_cache(); // Release versions older than the committed fallback.
     redraw = true;
@@ -804,28 +913,14 @@ static bool sync(bool manual) {
     collect_cache();
   }
   if (storage_full) { set_status("SD 卡空间不足，已下载内容已保留"); return true; }
-  if (manual) {
-    Http refresh{{}, {}, 2048};
-    int s = request(c, "/v1/refresh", refresh, "{}");
-    if (s == 202)
-      set_status("更新处理中，下次检查时接续");
-    else if (s == 429) {
-      bool pending;
-      {
-        std::lock_guard<std::mutex> g(model.mutex);
-        pending = model.sync_pending;
-      }
-      set_status(pending ? "正文下载中，下次检查接续" : "已同步", pending);
-    } else
-      return false;
-  } else {
-    bool pending;
-    {
-      std::lock_guard<std::mutex> g(model.mutex);
-      pending = model.sync_pending;
-    }
-    set_status(pending ? "正文下载中，下次检查接续" : "已同步", pending);
+  {
+    std::lock_guard<std::mutex> g(model.mutex);
+    // A 304 acknowledges the complete local snapshot. Upstream work may
+    // remain, but its previous pending flag must not survive completion.
+    if (status == 304) model.sync_pending = false;
+    model.sync_pending = model.sync_pending || model.refresh_waiting;
   }
+  sync_status();
   return true;
 }
 static bool download_article(const cJSON *input) {
@@ -1296,7 +1391,7 @@ void init_network() {
 }
 static void status_console() {
   Json j(cJSON_CreateObject());
-  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.8");
+  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.9");
   cJSON_AddStringToObject(j.get(), "font_family", "Noto Sans SC");
   cJSON_AddNumberToObject(j.get(), "font_weight", reader_font_weight);
   cJSON_AddBoolToObject(j.get(), "fonts_ready", reader_fonts_ready());
@@ -1333,6 +1428,8 @@ static void status_console() {
     cJSON_AddNumberToObject(j.get(), "setup_operation", setup_operation.id);
     cJSON_AddBoolToObject(j.get(), "setup_pending", setup_operation.pending);
     cJSON_AddBoolToObject(j.get(), "sync_pending", model.sync_pending);
+    cJSON_AddBoolToObject(j.get(), "upstream_refresh_pending", model.refresh_waiting);
+    cJSON_AddBoolToObject(j.get(), "check_notice", model.check_notice);
     cJSON_AddBoolToObject(j.get(), "local_proxy_configured", !model.config.local_server.empty());
     cJSON_AddBoolToObject(j.get(), "local_proxy_fallback", local_proxy_failed.load());
     cJSON_AddNumberToObject(j.get(), "font_size", model.config.font_size);
@@ -1464,7 +1561,7 @@ void console_task(void *) {
       esp_restart();
     else if (cmd == "setup" || cmd == "wifi" || cmd == "bind" ||
              cmd == "check" || cmd == "forget" || cmd == "local_proxy" || cmd == "setup_cancel") {
-      if (enqueue(cmd, line)) std::printf("ACCEPTED %s\n", cmd.c_str());
+      if (cmd == "check" ? request_check_update() : enqueue(cmd, line)) std::printf("ACCEPTED %s\n", cmd.c_str());
       else std::printf("RESULT {\"command\":\"%s\",\"ok\":false,\"code\":\"queue_full\"}\n", cmd.c_str());
     } else
       std::printf("ERROR invalid command\n");
@@ -1491,6 +1588,10 @@ void network_task(void *) {
     deadline = now_ms() + (external_cache_enabled() &&
         (action->type == "sync" || action->type == "check") ? 120000 :
         action->type == "download" ? 60000 : 20000);
+    if (action->type == "check") {
+      std::lock_guard<std::mutex> g(model.mutex);
+      model.check_queued = false;
+    }
     sync_made_progress = storage_full = false;
     if (external_cache_enabled()) {
       const auto capacity = sd_storage_capacity();
@@ -1607,6 +1708,7 @@ void network_task(void *) {
       connected = false;
       esp_wifi_stop();
     }
+    { std::lock_guard<std::mutex> g(model.mutex); model.last_network_ok = ok; }
     networking = false;
     bool pending;
     { std::lock_guard<std::mutex> g(model.mutex); pending = model.sync_pending; }

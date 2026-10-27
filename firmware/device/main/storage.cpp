@@ -139,6 +139,11 @@ bool save_sleep_probe(const std::string &json) {
          nvs_commit(handle) == ESP_OK;
 }
 std::string load_sleep_probe() { return get_string("sleep_probe"); }
+bool save_refresh_request(const std::string &id) {
+  return id.size() <= 64 &&
+         nvs_set_str(handle, "refresh_request", id.c_str()) == ESP_OK &&
+         nvs_commit(handle) == ESP_OK;
+}
 bool save_config(const Config &c) {
   Json root(cJSON_CreateObject());
   auto *a = cJSON_AddArrayToObject(root.get(), "networks");
@@ -235,6 +240,13 @@ bool load_storage() {
           ESP_OK)
     return false;
   index_handle = handle;
+  model.refresh_id = get_string("refresh_request");
+  if (!model.refresh_id.empty() && model.refresh_id.size() <= 64 &&
+      model.refresh_id.find_first_not_of("0123456789abcdef") == std::string::npos) {
+    model.refresh_waiting = model.sync_pending = model.check_notice = true;
+    model.status = "等待继续同步所有来源";
+  } else
+    model.refresh_id.clear();
   Json root(cJSON_Parse(get_string("config").c_str()));
   if (root) {
     cJSON *j;

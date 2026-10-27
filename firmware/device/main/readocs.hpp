@@ -72,6 +72,11 @@ struct Model {
   std::string etag, status = "等待配置", ssid, ip, ap_ssid, ap_password,
                     ap_session;
   bool ap = false, initialized = false, sync_pending = false;
+  std::string refresh_id, refresh_message;
+  bool refresh_waiting = false, refresh_failed = false, check_notice = false;
+  bool check_queued = false;
+  bool last_network_ok = true;
+  int64_t last_check_ms = -1;
 };
 extern Model model;
 // Network work must not start while the whole chip is in manual light sleep.
@@ -117,6 +122,8 @@ extern Position position;
 int64_t now_ms();
 void set_status(const std::string &s, bool visible = true);
 bool enqueue(const std::string &type, const std::string &json = "");
+bool request_check_update();
+bool save_refresh_request(const std::string &id);
 std::string sha256(const std::string &s);
 bool valid_hash(const std::string &s);
 std::string read_file(const std::string &name, size_t limit = 310 * 1024);
@@ -141,7 +148,8 @@ std::vector<Page> layout(const std::string &snapshot, int size);
 void draw_page(const Entry &entry, const std::vector<Page> &pages, int index);
 void draw_menu(const std::vector<std::string> &options, int selected,
                const std::string &title);
-void draw_sources(const std::vector<Source> &sources, int selected);
+void draw_sources(const std::vector<Source> &sources, int selected,
+                  const std::string &status = "");
 void draw_articles(const std::vector<Entry> &entries, int selected,
                    const std::string &source_title, int source_count);
 void draw_message(const std::string &title,

@@ -188,8 +188,9 @@ class Worker:
             # Never persist upstream payloads or exception strings which can contain secrets.
             with self.store.db:
                 self.store.db.execute(
-                    "UPDATE sources SET error='INTERNAL_ERROR',due=? WHERE id=? AND generation=?",
+                    "UPDATE sources SET error='INTERNAL_ERROR',checked=?,failures=failures+1,due=? WHERE id=? AND generation=?",
                     (
+                        time.time(),
                         time.time() + source["interval"],
                         source["id"],
                         source["generation"],
