@@ -200,3 +200,11 @@ OAuth 回调有单次 state、浏览器绑定、会话期限及配置版本校�
 热点在 APSTA → STA 的约 300,062 ms 后自动关闭，期间 USB 状态轮询未延长时限，关闭后无线停止；可通过菜单重新进入配网。
 
 同日按用户要求，将工作机 Homebrew cloudflared 2026.10.0 升至 2026.10.3。正式隧道先启动新副本，确认 4 条连接与 readiness 200，再逐条优雅退出旧实例；用户确认允许临时隧道更换 URL 后，对 Quick Tunnel 同样先启动并验证新地址返回 200。两个实际运行进程均从 2026.10.3 路径加载，正式配置逐字节保留，没有关闭 TLS 验证；已检查的源站为本机 HTTP 或 Readocs 自签名证书，没有发现受影响的 eMudhra 链。用户确认没有其他运行主机。新临时地址与私有验证报告位于 `artifacts/cloudflared-2026-10-27/`；依据为 [Cloudflare 官方公告](https://blog.cloudflare.com/emudhra-certificate-compromise/)及 [2026.10.3 发布](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.3)。
+
+## 管理页公网入口（2026-10-27）
+
+按用户要求，在现有远程管理隧道中新增 `readocs.kejun.link` 的无路径限制规则，源站为 `http://127.0.0.1:8765`，位于原 `/v1/*` 设备规则之后。原设备规则仍指向 `https://127.0.0.1:8766`，CA 与源站主机名校验设置逐项一致；其他既有规则和末尾 404 保留。运行中的连接器已在线加载配置版本 3，无需重启。本地 YAML 不包含这项远程规则，后续维护应以 Cloudflare 控制台及连接器实际收到的配置为准。
+
+应用原有策略要求公网 HTTPS，因此另外添加仅匹配 `http://readocs.kejun.link/*` 的 308 跳转，目标 `https://readocs.kejun.link/${1}`，保留路径、查询参数和请求方法；未修改其他子域名的 HTTP 行为。访问[管理页](https://readocs.kejun.link/)仍使用本机已有的管理密钥，未创建新凭据。
+
+公网验证：HTTP 根路径及带编码查询参数的静态资源均按预期跳转到 HTTPS；登录页、脚本和样式返回 200；登录、读取状态、退出通过，HTTPS 会话 Cookie 带 Secure；未登录管理 API、设备 `/v1/sync` 均为 401，错误 Origin 为 403。浏览器可正常显示登录页，已授权状态接口返回两来源、飞书 454 篇已有正文、失败 0。私有配置备份与验证报告位于 `artifacts/management-tunnel-2026-10-27/`。本轮仅变更 Cloudflare 配置及此记录，未修改代理或固件实现。
