@@ -7,7 +7,7 @@ import re
 import secrets
 import time
 
-from .dates import upstream_time
+from .dates import timestamp, title_timestamp, upstream_time
 from .errors import TRANSIENT_ERRORS, Problem, retry_delay
 from .store import digest
 
@@ -15,6 +15,24 @@ logger = logging.getLogger(__name__)
 DIRECTORY_TIMEOUT = 35
 DOCUMENT_TIMEOUT = 120
 DIRECTORY_MAX_FAILURES = 6
+
+
+def body_order(item):
+    # Reading order can use dates in titles; checking order must first bring
+    # recent edits to the device, even when an old article was edited today.
+    dates = (
+        timestamp(item["content_updated_at"]),
+        timestamp(item["content_created_at"]),
+        title_timestamp(item["title"]),
+    )
+    date = next((value for value in dates if value is not None), None)
+    return (
+        item["error"] is None,
+        date is None,
+        -date if date is not None else 0,
+        item["due"],
+        item["id"],
+    )
 
 
 def identifier(value):
@@ -235,12 +253,16 @@ class Library:
                     store.db.execute(
                         "UPDATE sources SET fetched=? WHERE id='feishu'", (time.time(),)
                     )
-        for item in store.rows(
-            "SELECT i.*,d.updated AS content_updated_at FROM feishu_items i "
+        items = store.rows(
+            "SELECT i.*,d.updated AS content_updated_at,d.created AS content_created_at,d.snapshot_id "
+            "FROM feishu_items i "
             "LEFT JOIN documents d ON d.source_id='feishu' AND d.id=i.id "
-            "WHERE i.due<=? ORDER BY (i.error IS NULL),i.due,i.id LIMIT 1",
+            "WHERE i.due<=?",
             (time.time(),),
-        ):
+        )
+        items.sort(key=body_order)
+        for item in items[:1]:
+            started = time.monotonic()
             try:
                 async with asyncio.timeout(DOCUMENT_TIMEOUT):
                     doc = await self.feishu.fetch(
@@ -280,7 +302,7 @@ class Library:
             if not self.current(source):
                 return
             with store.db:
-                store.save_snapshot("feishu", doc)
+                snapshot_id = store.save_snapshot("feishu", doc)
                 store.db.execute(
                     "UPDATE feishu_items SET due=?,error=NULL,failures=0 WHERE id=?",
                     (time.time() + source["interval"], item["id"]),
@@ -290,6 +312,12 @@ class Library:
                 )
             if item["error"]:
                 logger.info("feishu_document_recovered document=%s", item["id"])
+            logger.info(
+                "feishu_document_checked document=%s changed=%s elapsed=%.3f",
+                item["id"],
+                snapshot_id != item["snapshot_id"],
+                time.monotonic() - started,
+            )
         next_item = store.db.execute("SELECT MIN(due) FROM feishu_items").fetchone()[0]
         next_directory = store.db.execute(
             "SELECT MIN(due) FROM feishu_frontier WHERE done=0"

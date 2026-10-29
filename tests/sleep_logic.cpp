@@ -26,6 +26,7 @@ static std::function<void()> during_delay;
 static std::function<void()> during_cover;
 static int retained_view = static_cast<int>(rd::View::Articles);
 static int64_t next_sync_at = 0;
+static uint64_t timer_wakeup_us = 0;
 static bool entered_sleep = false, covered = false;
 static struct {
   struct {
@@ -43,7 +44,10 @@ static void power_key_prepare_sleep() {}
 static void esp_wifi_stop() {}
 static void esp_deep_sleep_start() { entered_sleep = true; }
 static int esp_sleep_enable_ext1_wakeup_io(uint64_t, int) { return 0; }
-static int esp_sleep_enable_timer_wakeup(uint64_t) { return 0; }
+static int esp_sleep_enable_timer_wakeup(uint64_t us) {
+  timer_wakeup_us = us;
+  return 0;
+}
 static void rtc_gpio_pullup_en(int) {}
 static void rtc_gpio_pulldown_dis(int) {}
 #define GPIO_NUM_3 3
@@ -76,6 +80,8 @@ int main() {
     during_delay = {};
     during_cover = {};
     sleeping = entered_sleep = covered = false;
+    next_sync_at = 0;
+    timer_wakeup_us = 0;
   };
   reset();
   rd::InputLogic input;
@@ -126,4 +132,17 @@ int main() {
   sleep_now(true);
   assert(covered && entered_sleep);
   assert(retained_view == static_cast<int>(View::Reading));
+
+  reset();
+  next_sync_at = std::time(nullptr) - 1;
+  sleep_now();
+  assert(entered_sleep && timer_wakeup_us == 30 * 1000000ULL);
+  reset();
+  next_sync_at = std::time(nullptr) + 90;
+  sleep_now();
+  assert(entered_sleep && timer_wakeup_us >= 89 * 1000000ULL &&
+         timer_wakeup_us <= 90 * 1000000ULL);
+  reset();
+  sleep_now();
+  assert(entered_sleep && timer_wakeup_us == model.config.interval * 1000000ULL);
 }

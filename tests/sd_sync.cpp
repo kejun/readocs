@@ -3,6 +3,7 @@
 #include "cache_policy.hpp"
 #include "source_metadata.hpp"
 #include <cassert>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <iomanip>
@@ -14,7 +15,7 @@
 #include <vector>
 namespace rd {
 #include "sd_types.hpp"
-struct Config { std::string server="https://proxy",token="test"; };
+struct Config { std::string server="https://proxy",token="test",local_server; };
 struct Model {
  std::mutex mutex;
  std::vector<Entry> entries;
@@ -35,6 +36,9 @@ static std::string saved_refresh,refresh_state="running";
 static bool save_refresh_ok=true;
 static bool interrupt_on_read=false;
 static int refresh_code=202,status_code=200;
+static int probe_code=200;
+static bool probe_fallback=false;
+static std::atomic<bool> local_proxy_failed{false};
 static std::vector<std::string> calls;
 static bool save_refresh_request(const std::string &id) {if(!save_refresh_ok)return false;saved_refresh=id;return true;}
 static std::map<std::string,std::string> files,bodies,ids;
@@ -69,7 +73,11 @@ static int request(const Config &,const std::string &path,Http &out,const std::s
  calls.push_back(path);
  ++clock_ms;
  Json root(cJSON_CreateObject());
- if(path=="/v1/refresh") {
+ if(path=="/v1/status") {
+  if(probe_fallback)local_proxy_failed=true;
+  out.body=R"({"schema_version":1})";
+  return probe_code;
+ } else if(path=="/v1/refresh") {
   out.body=R"({"schema_version":1,"refresh_id":"abcdef123456"})";
   return refresh_code;
  } else if(path=="/v1/status?refresh_id=abcdef123456") {
@@ -114,6 +122,7 @@ static void reset(bool external) {
  model.check_queued=false;
  interrupt_on_read=false;
  saved_refresh.clear();refresh_state="running";save_refresh_ok=true;refresh_code=202;status_code=200;calls.clear();
+ probe_code=200;probe_fallback=false;local_proxy_failed=false;
  for(int i=0;i<30;++i){auto doc="doc"+std::to_string(i);auto body="{\"schema_version\":1,\"blocks\":[{\"block_id\":\""+doc+"\",\"text\":\"Chinese reader\"}]}";auto id=sha256(body);ids[doc]=id;bodies[id]=body;}
 }
 static void round(int budget) {deadline=clock_ms+budget;sync_made_progress=storage_full=false;assert(sync(false));}
@@ -171,4 +180,21 @@ int main(){using namespace rd;
  assert(!repair_external_entries(repairing,true));
  assert(repairing[0].snapshot_id.empty() && !repairing[1].snapshot_id.empty());
  assert(calls.empty()); // A newly queued check interrupts safely between files.
+
+ // Select a reachable route with a safe GET before submitting a new refresh.
+ Config local;local.local_server="https://local";
+ reset(true);deadline=120000;probe_fallback=true;
+ assert(refresh_sources(local,true));
+ assert(local_proxy_failed && calls==std::vector<std::string>({"/v1/status","/v1/refresh","/v1/status?refresh_id=abcdef123456"}));
+ assert(std::count(calls.begin(),calls.end(),"/v1/refresh")==1);
+ calls.clear();assert(refresh_sources(local,true));
+ assert(calls==std::vector<std::string>({"/v1/status?refresh_id=abcdef123456"}));
+
+ reset(true);deadline=120000;probe_code=503;
+ assert(!refresh_sources(local,true) && saved_refresh.empty());
+ assert(calls==std::vector<std::string>({"/v1/status"}));
+
+ reset(true);deadline=120000;refresh_code=-1;
+ assert(!refresh_sources(local,true) && saved_refresh.empty());
+ assert(calls==std::vector<std::string>({"/v1/status","/v1/refresh"}));
 }

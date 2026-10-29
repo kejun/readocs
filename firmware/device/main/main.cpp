@@ -98,7 +98,8 @@ static void sleep_now(bool show_cover = false, bool require_idle = false) {
   rtc_gpio_pulldown_dis(GPIO_NUM_3);
   rtc_gpio_pulldown_dis(GPIO_NUM_4);
   auto now = std::time(nullptr);
-  int64_t seconds = next_sync_at > now ? next_sync_at - now : interval;
+  // An overdue check must wake soon, not be postponed for another full period.
+  int64_t seconds = next_sync_at > 0 ? next_sync_at - now : interval;
   ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(std::max<int64_t>(30, seconds) *
                                                 1000000ULL));
   esp_deep_sleep_start();

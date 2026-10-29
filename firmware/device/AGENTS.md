@@ -7,6 +7,7 @@
 - 以当前可见像素决定刷新，屏外下载进度、快照 hash 或时钟不能使当前列表整页重刷。
 - 字体使用原生 16 / 24 / 32 像素的 1 位 Noto Sans SC Medium（500 字重）与独立黑白 Emoji；测宽、绘制和裁剪共用完整序列映射。字体资源修订号须参与分页恢复和旧帧失效，不得复用旧字体页码。修改字体或排版时另运行 `tests/test_fonts.py` 和 `tests/test_reader_layout.py`，使用实际 BFF 解码与资源验证。
 - 电池连续操作窗口使用保留 PSRAM 的轻睡，不要改回每次操作 1 秒后深睡，也不要用 CPU 空转代替。深睡后的首帧仍需完整重建。
+- 深睡时若下次同步时间已到或已过，须在最多 30 秒后唤醒，不能延后整个检查周期。有局域网配置的新人工检查先用只读状态 GET 选可达线路，再只发一次 POST；已有请求 ID 直接接续，禁止通过重放 POST 修复线路回退。
 - 保留独立按键采样、波形期间事件积累、释放/队列保护以及 PM1 电源键语义。
 - 配网检查同时保留 AP 接口绑定、本地/对端地址校验和会话令牌，不能按 `Host` 或转发头放行。状态轮询不能刷新五分钟活动时间；关联、DHCP、保存全部成功后才报告成功，热点延迟关闭后仍需停止空闲 Wi-Fi。配网改动运行 `tests/test_setup_access.py`、`tests/test_wifi_setup.py`、`tests/test_setup_page.py` 与 USB 工具回归，并更新[配网记录](../../docs/wifi-provisioning-improvements.md)。
 - SD 缓存遵守[存储与同步说明](../../docs/device-storage.md)：禁止自动格式化，保留独立的片内回退指针与文件，GC 只处理本机专用目录。低剩余空间不能仅因低于下载余量就放弃已有离线缓存。不要在按键唤醒或快速绘制路径验证整库正文；文件打开和下载仍需哈希校验。同步改动须运行 `tests/test_sd_sync.py`、`tests/test_sd_storage.py` 及缓存提交、GC、来源和下载回归，保留目标快照与清单版本的接续语义；请求路径和重试改动另运行 `tests/test_firmware_transport.py`，保持 TLS 校验且不自动重放 POST。

@@ -309,7 +309,7 @@ static int request(const Config &c, const std::string &path, Http &out,
     esp_http_client_config_t h{};
     h.url = url.c_str();
     h.timeout_ms = std::clamp<int64_t>(deadline - now_ms(), 1, local ? 2500 : external_cache_enabled() ? 15000 : 5000);
-    h.user_agent = "Readocs/0.2.9 (PaperDIY; ESP32-S3)";
+    h.user_agent = "Readocs/0.2.10 (PaperDIY; ESP32-S3)";
     h.common_name = http_name.empty() ? nullptr : http_name.c_str();
     h.event_handler = http_event;
     h.disable_auto_redirect = true;
@@ -573,6 +573,12 @@ static bool refresh_sources(const Config &c, bool manual) {
   { std::lock_guard<std::mutex> g(model.mutex); id = model.refresh_id; }
   if (manual && id.empty()) {
     set_status("正在触发所有来源更新");
+    if (!c.local_server.empty() && !local_proxy_failed) {
+      // Select LAN/public with a retryable GET before the one-shot POST.
+      // Away from the saved LAN, a failed POST cannot safely be replayed.
+      Http route{{}, {}, 8192};
+      if (request(c, "/v1/status", route) != 200) return false;
+    }
     Http out{{}, {}, 4096};
     // POST is deliberately sent once. A lost response is not replayed.
     if (request(c, "/v1/refresh", out, "{}") != 202) return false;
@@ -1391,7 +1397,7 @@ void init_network() {
 }
 static void status_console() {
   Json j(cJSON_CreateObject());
-  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.9");
+  cJSON_AddStringToObject(j.get(), "firmware", "readocs-0.2.10");
   cJSON_AddStringToObject(j.get(), "font_family", "Noto Sans SC");
   cJSON_AddNumberToObject(j.get(), "font_weight", reader_font_weight);
   cJSON_AddBoolToObject(j.get(), "fonts_ready", reader_fonts_ready());

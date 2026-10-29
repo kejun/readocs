@@ -70,7 +70,9 @@ static int esp_http_client_set_post_field(Client *c, const char *body, int size)
 static int esp_http_client_set_url(Client *c, const char *url) { c->url = url; return ESP_OK; }
 static int esp_http_client_set_timeout_ms(Client *, int timeout) { assert(timeout > 0); return ESP_OK; }
 static int esp_http_client_set_method(Client *c, int method) { c->method = method; return ESP_OK; }
-static int esp_http_client_get_status_code(Client *) { return 200; }
+static int esp_http_client_get_status_code(Client *c) {
+  return c->method == HTTP_METHOD_POST ? 202 : 200;
+}
 static int esp_http_client_perform(Client *c) {
   assert(c->headers.at("Authorization") == "Bearer device-token");
   assert(c->headers.at("X-Protocol-Version") == "1");
@@ -115,6 +117,19 @@ int main() {
   Http post{{}, {}, 1024};
   assert(request(c, "/v1/refresh", post, "{}") == -1);
   assert(attempts == 1 && !local_proxy_failed); // A POST is never replayed.
+
+  reset({ESP_FAIL, ESP_FAIL, ESP_OK, ESP_OK});
+  Http probe{{}, {}, 1024}, refresh{{}, {}, 1024};
+  assert(request(c, "/v1/status", probe) == 200 && local_proxy_failed);
+  assert(request(c, "/v1/refresh", refresh, "{}") == 202);
+  assert(urls == std::vector<std::string>({"https://local/v1/status", "https://local/v1/status", "https://public/v1/status", "https://public/v1/refresh"}));
+
+  reset({ESP_OK, ESP_FAIL});
+  Http ready{{}, {}, 1024}, lost{{}, {}, 1024};
+  assert(request(c, "/v1/status", ready) == 200);
+  assert(request(c, "/v1/refresh", lost, "{}") == -1);
+  assert(attempts == 2 && !local_proxy_failed);
+  assert(urls == std::vector<std::string>({"https://local/v1/status", "https://local/v1/refresh"}));
 
   reset({ESP_FAIL});
   overflow = true;
